@@ -145,8 +145,9 @@ password-mode reconnect behavior:
 proxy mode:
 - both client launchers can prompt for `no|socks5|http`
 - proxy format is `host:port` or `host:port:username:password`
-- Windows: `ncat` is only needed when using OpenSSH proxy mode; launcher auto-attempts `winget install Nmap.Nmap`.
-- Linux: launcher auto-attempts package-manager install for `ncat` when proxy is enabled.
+- proxy routing uses `ncat` via `ProxyCommand` / `-proxycmd`.
+- Windows launcher auto-attempts `winget install Nmap.Nmap` when proxy is enabled.
+- Linux launcher auto-attempts package-manager install for `ncat` when proxy is enabled.
 
 connection resilience:
 - keepalive is enabled (`ServerAliveInterval 15`, `ServerAliveCountMax 120`, `TCPKeepAlive yes`) to reduce idle/NAT drops.

@@ -167,14 +167,14 @@ function Offer-DesktopShortcut {
         return
     }
 
-    $shortcutPath = Join-Path $desktopPath "sticky-codex.lnk"
+    $shortcutPath = Join-Path $desktopPath "Sticky Codex.lnk"
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($shortcutPath)
     $shortcut.TargetPath = "powershell.exe"
     $shortcut.Arguments = "-NoExit -ExecutionPolicy Bypass -File `"$ScriptPath`" -ProfileFile `"$ProfilePath`""
     $shortcut.WorkingDirectory = (Split-Path -Parent $ScriptPath)
     $shortcut.IconLocation = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe,0"
-    $shortcut.Description = "start sticky-codex reconnect launcher"
+    $shortcut.Description = "start Sticky Codex reconnect launcher"
     $shortcut.Save()
 
     Write-Host "desktop shortcut created: $shortcutPath"

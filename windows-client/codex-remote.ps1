@@ -45,7 +45,7 @@ $script:PscpExe = "pscp"
 $script:NcatExe = "ncat"
 
 function Show-Banner {
-    Write-Host "sticky-codex"
+    Write-Host "Sticky Codex"
     Write-Host "AGPL-3.0-or-later"
     Write-Host "Morrow Shore https://morrowshore.com"
     Write-Host ""
@@ -300,11 +300,7 @@ function Resolve-NcatExe {
     return $false
 }
 
-function Ensure-NcatForOpenSshProxy {
-    if ($script:SshBackend -ne "openssh") {
-        return
-    }
-
+function Ensure-NcatForProxy {
     if ($script:ProxyType -eq "no" -or [string]::IsNullOrWhiteSpace($script:ProxySpec)) {
         return
     }
@@ -315,7 +311,7 @@ function Ensure-NcatForOpenSshProxy {
 
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if ($winget) {
-        Write-Host "proxy mode with OpenSSH requires ncat. attempting install via winget (Nmap)..."
+        Write-Host "proxy mode requires ncat. attempting install via winget (Nmap)..."
         try {
             & winget install --id Nmap.Nmap -e --accept-package-agreements --accept-source-agreements --silent | Out-Null
         } catch {
@@ -323,7 +319,7 @@ function Ensure-NcatForOpenSshProxy {
     }
 
     if (-not (Resolve-NcatExe)) {
-        throw "proxy mode with OpenSSH requires ncat. install Nmap (ncat), or use password auth (PuTTY backend)."
+        throw "proxy mode requires ncat. install Nmap (ncat), then retry."
     }
 }
 
@@ -332,16 +328,7 @@ function Get-PuttyProxyArgs {
         return @()
     }
 
-    $proxy = Parse-ProxySpec -Spec $script:ProxySpec
-    $puttyType = if ($script:ProxyType -eq "socks5") { "5" } else { "http" }
-    $args = @("-proxytype", $puttyType, "-proxyhost", $proxy.Host, "-proxyport", $proxy.Port)
-
-    if (-not [string]::IsNullOrWhiteSpace($proxy.Username)) {
-        $args += @("-proxyuser", $proxy.Username)
-        $args += @("-proxypass", $proxy.Password)
-    }
-
-    return $args
+    return @("-proxycmd", (Build-NcatProxyCommand -TargetHostToken "%host" -TargetPortToken "%port"))
 }
 
 function Resolve-PuttyToolsFromKnownLocations {
@@ -1040,7 +1027,7 @@ Show-Banner
 Ensure-WindowsOpenSsh
 Ensure-Codex
 Select-SshBackend
-Ensure-NcatForOpenSshProxy
+Ensure-NcatForProxy
 Write-TempSshConfig
 Test-RemotePrereqs
 

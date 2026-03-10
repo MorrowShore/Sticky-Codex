@@ -623,7 +623,7 @@ if [ -z "$HOST_NAME" ] || [ -z "$USER_NAME" ] || [ -z "$REMOTE_PROJECT_DIR" ]; t
 fi
 
 show_banner() {
-  printf '%s\n' "sticky-codex"
+  printf '%s\n' "Sticky Codex"
   printf '%s\n' "AGPL-3.0-or-later"
   printf '%s\n' "Morrow Shore https://morrowshore.com"
   printf '\n'
