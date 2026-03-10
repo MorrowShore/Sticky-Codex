@@ -31,12 +31,17 @@ param(
     [ValidateSet("auto", "key", "password")]
     [string]$AuthMode = "auto",
     [string]$Password = "",
+    [ValidateSet("no", "socks5", "http")]
+    [string]$ProxyType = "no",
+    [string]$ProxySpec = "",
     [string]$ProfileFile = $(Join-Path $env:LOCALAPPDATA "sticky-codex\connection.env"),
     [switch]$Help
 )
 
 $ErrorActionPreference = "Stop"
 $script:SshBackend = "openssh"
+$script:PlinkExe = "plink"
+$script:PscpExe = "pscp"
 
 function Show-Banner {
     Write-Host "sticky-codex"
@@ -62,6 +67,8 @@ options:
   -ReconnectDelaySeconds 3
   -AuthMode auto|key|password
   -Password yourpassword
+  -ProxyType no|socks5|http
+  -ProxySpec 127.0.0.1:8080[:username:password]
   -ProfileFile C:\Users\you\AppData\Local\sticky-codex\connection.env
   -NoSyncAuth
   -RemoteScript /usr/local/bin/codex-vps
@@ -163,6 +170,289 @@ function Decode-Base64 {
     } catch {
         return ""
     }
+}
+
+function Encode-Base64 {
+    param([string]$Text)
+
+    if ([string]::IsNullOrEmpty($Text)) {
+        return ""
+    }
+
+    return [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text))
+}
+
+function Escape-ProfileValue {
+    param([string]$Value)
+
+    if ($null -eq $Value) {
+        return ""
+    }
+
+    return ($Value -replace '\\', '\\\\' -replace '"', '\"')
+}
+
+function Write-ProfileFile {
+    param([string]$Path)
+
+    $profileDir = Split-Path -Parent $Path
+    if (-not (Test-Path $profileDir)) {
+        $null = New-Item -ItemType Directory -Force -Path $profileDir
+    }
+
+    $lines = @(
+        "# sticky-codex connection profile",
+        ('HOST_ALIAS="{0}"' -f (Escape-ProfileValue $script:HostAlias)),
+        ('HOST_NAME="{0}"' -f (Escape-ProfileValue $script:HostName)),
+        ('USER_NAME="{0}"' -f (Escape-ProfileValue $script:UserName)),
+        ('PORT="{0}"' -f (Escape-ProfileValue "$script:Port")),
+        ('IDENTITY_FILE="{0}"' -f (Escape-ProfileValue $script:IdentityFile)),
+        ('REMOTE_PROJECT_DIR="{0}"' -f (Escape-ProfileValue $script:RemoteProjectDir)),
+        ('SESSION_NAME="{0}"' -f (Escape-ProfileValue $script:SessionName)),
+        ('IDLE_DAYS="{0}"' -f (Escape-ProfileValue "$script:IdleDays")),
+        ('RECONNECT_DELAY_SECONDS="{0}"' -f (Escape-ProfileValue "$script:ReconnectDelaySeconds")),
+        ('SYNC_AUTH="{0}"' -f (Escape-ProfileValue $(if ($script:NoSyncAuth) { "0" } else { "1" }))),
+        ('REMOTE_SCRIPT="{0}"' -f (Escape-ProfileValue $script:RemoteScript)),
+        ('AUTH_MODE="{0}"' -f (Escape-ProfileValue $script:AuthMode)),
+        ('PASSWORD_B64="{0}"' -f (Escape-ProfileValue (Encode-Base64 $script:Password))),
+        ('PROXY_TYPE="{0}"' -f (Escape-ProfileValue $script:ProxyType)),
+        ('PROXY_SPEC="{0}"' -f (Escape-ProfileValue $script:ProxySpec)),
+        'PASSWORD=""'
+    )
+
+    Set-Content -Path $Path -Value ($lines -join "`r`n")
+}
+
+function Parse-ProxySpec {
+    param([string]$Spec)
+
+    $parts = $Spec.Split(":")
+    if ($parts.Count -ne 2 -and $parts.Count -ne 4) {
+        throw "invalid proxy spec. expected host:port or host:port:username:password"
+    }
+
+    $host = $parts[0].Trim()
+    $port = $parts[1].Trim()
+    if ([string]::IsNullOrWhiteSpace($host) -or [string]::IsNullOrWhiteSpace($port)) {
+        throw "invalid proxy spec. host and port are required."
+    }
+
+    $username = ""
+    $password = ""
+    if ($parts.Count -eq 4) {
+        $username = $parts[2]
+        $password = $parts[3]
+    }
+
+    return @{
+        Host = $host
+        Port = $port
+        Username = $username
+        Password = $password
+    }
+}
+
+function Build-NcatProxyCommand {
+    param(
+        [string]$TargetHostToken,
+        [string]$TargetPortToken
+    )
+
+    if ($script:ProxyType -eq "no" -or [string]::IsNullOrWhiteSpace($script:ProxySpec)) {
+        return ""
+    }
+
+    $ncat = Get-Command ncat -ErrorAction SilentlyContinue
+    if (-not $ncat) {
+        throw "proxy mode requires ncat in PATH."
+    }
+
+    $proxy = Parse-ProxySpec -Spec $script:ProxySpec
+    $type = if ($script:ProxyType -eq "socks5") { "socks5" } else { "http" }
+    $cmd = "ncat --proxy $($proxy.Host):$($proxy.Port) --proxy-type $type"
+    if (-not [string]::IsNullOrWhiteSpace($proxy.Username)) {
+        $cmd += " --proxy-auth $($proxy.Username):$($proxy.Password)"
+    }
+    $cmd += " $TargetHostToken $TargetPortToken"
+
+    return $cmd
+}
+
+function Resolve-PuttyToolsFromKnownLocations {
+    $plink = Get-Command plink -ErrorAction SilentlyContinue
+    $pscp = Get-Command pscp -ErrorAction SilentlyContinue
+
+    $known = @(
+        "$env:ProgramFiles\PuTTY\plink.exe",
+        "$env:ProgramFiles(x86)\PuTTY\plink.exe",
+        (Join-Path $env:LOCALAPPDATA "sticky-codex\tools\plink.exe")
+    )
+    if (-not $plink) {
+        foreach ($candidate in $known) {
+            if (Test-Path $candidate) {
+                $plink = @{ Source = $candidate }
+                break
+            }
+        }
+    }
+
+    $known = @(
+        "$env:ProgramFiles\PuTTY\pscp.exe",
+        "$env:ProgramFiles(x86)\PuTTY\pscp.exe",
+        (Join-Path $env:LOCALAPPDATA "sticky-codex\tools\pscp.exe")
+    )
+    if (-not $pscp) {
+        foreach ($candidate in $known) {
+            if (Test-Path $candidate) {
+                $pscp = @{ Source = $candidate }
+                break
+            }
+        }
+    }
+
+    if ($plink -and $pscp) {
+        $script:PlinkExe = $plink.Source
+        $script:PscpExe = $pscp.Source
+        return $true
+    }
+
+    return $false
+}
+
+function Download-PuttyPortableTools {
+    $toolDir = Join-Path $env:LOCALAPPDATA "sticky-codex\tools"
+    $null = New-Item -ItemType Directory -Force -Path $toolDir
+
+    $targets = @(
+        @{
+            Plink = "https://the.earth.li/~sgtatham/putty/latest/w64/plink.exe"
+            Pscp = "https://the.earth.li/~sgtatham/putty/latest/w64/pscp.exe"
+        },
+        @{
+            Plink = "https://the.earth.li/~sgtatham/putty/latest/w32/plink.exe"
+            Pscp = "https://the.earth.li/~sgtatham/putty/latest/w32/pscp.exe"
+        }
+    )
+
+    foreach ($variant in $targets) {
+        $plinkPath = Join-Path $toolDir "plink.exe"
+        $pscpPath = Join-Path $toolDir "pscp.exe"
+
+        try {
+            Invoke-WebRequest -Uri $variant.Plink -OutFile $plinkPath
+            Invoke-WebRequest -Uri $variant.Pscp -OutFile $pscpPath
+        } catch {
+            continue
+        }
+
+        if ((Test-Path $plinkPath) -and (Test-Path $pscpPath)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Ensure-PuttyTools {
+    if (Resolve-PuttyToolsFromKnownLocations) {
+        return $true
+    }
+
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if ($winget) {
+        Write-Host "plink/pscp not found. attempting to install PuTTY with winget..."
+        try {
+            & winget install --id PuTTY.PuTTY -e --accept-package-agreements --accept-source-agreements --silent | Out-Null
+        } catch {
+        }
+
+        if (Resolve-PuttyToolsFromKnownLocations) {
+            return $true
+        }
+    }
+
+    Write-Host "winget install did not provide plink/pscp. attempting portable PuTTY download..."
+    if ((Download-PuttyPortableTools) -and (Resolve-PuttyToolsFromKnownLocations)) {
+        Write-Host "downloaded portable plink/pscp into %LOCALAPPDATA%\sticky-codex\tools."
+        return $true
+    }
+
+    return $false
+}
+
+function Initialize-ProfileIfMissing {
+    if (Test-Path $script:ProfileFile) {
+        return
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($script:HostName) -and -not [string]::IsNullOrWhiteSpace($script:UserName) -and -not [string]::IsNullOrWhiteSpace($script:RemoteProjectDir)) {
+        return
+    }
+
+    if (-not [Environment]::UserInteractive) {
+        Write-Host "connection profile was not found: $script:ProfileFile"
+        Write-Host "run quick-install once to create it, or pass one-run overrides."
+        exit 1
+    }
+
+    Write-Host "connection profile not found. creating one now..."
+    Write-Host ""
+
+    $defaultHostAlias = if ([string]::IsNullOrWhiteSpace($script:HostAlias)) { "myvps" } else { $script:HostAlias }
+    $script:HostAlias = Prompt-WithDefault -Prompt "host alias" -Default $defaultHostAlias
+    $script:HostName = Prompt-Required -Prompt "remote host (ip or domain)" -Default $script:HostName
+    $defaultUserName = if ([string]::IsNullOrWhiteSpace($script:UserName)) { "root" } else { $script:UserName }
+    $script:UserName = Prompt-Required -Prompt "remote user" -Default $defaultUserName
+    $script:Port = [int](Prompt-WithDefault -Prompt "ssh port" -Default "$script:Port")
+    $script:RemoteProjectDir = Prompt-Required -Prompt "remote project directory" -Default $script:RemoteProjectDir
+    $script:SessionName = Prompt-WithDefault -Prompt "session name (blank for auto)" -Default $script:SessionName
+    $script:IdleDays = [int](Prompt-WithDefault -Prompt "idle days before stale session cleanup" -Default "$script:IdleDays")
+    $script:ReconnectDelaySeconds = [int](Prompt-WithDefault -Prompt "reconnect delay seconds" -Default "$script:ReconnectDelaySeconds")
+
+    while ($true) {
+        $mode = (Prompt-WithDefault -Prompt "ssh auth mode (auto/key/password)" -Default $script:AuthMode).ToLowerInvariant()
+        if ($mode -in @("auto", "key", "password")) {
+            $script:AuthMode = $mode
+            break
+        }
+        Write-Host "please enter auto, key, or password."
+    }
+
+    if ($script:AuthMode -in @("auto", "key")) {
+        $script:IdentityFile = Prompt-WithDefault -Prompt "ssh identity file path (optional)" -Default $script:IdentityFile
+    }
+
+    if ($script:AuthMode -eq "password" -and [string]::IsNullOrWhiteSpace($script:Password)) {
+        $secure = Read-Host "ssh password (stored in profile)" -AsSecureString
+        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+        try {
+            $script:Password = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        } finally {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        }
+    }
+
+    $syncChoice = (Prompt-WithDefault -Prompt "sync local Codex auth.json before attach? (Y/n)" -Default "Y").ToLowerInvariant()
+    $script:NoSyncAuth = ($syncChoice -in @("n", "no"))
+
+    while ($true) {
+        $proxyChoice = (Prompt-WithDefault -Prompt "Run through proxy? [no]  no/socks5/http" -Default "no").ToLowerInvariant()
+        if ($proxyChoice -in @("no", "socks5", "http")) {
+            $script:ProxyType = $proxyChoice
+            break
+        }
+        Write-Host "please enter no, socks5, or http."
+    }
+
+    if ($script:ProxyType -ne "no") {
+        $script:ProxySpec = Prompt-Required -Prompt "proxy address (host:port or host:port:username:password)" -Default $script:ProxySpec
+    } else {
+        $script:ProxySpec = ""
+    }
+
+    Write-ProfileFile -Path $script:ProfileFile
+    Write-Host "saved connection profile: $script:ProfileFile"
+    Write-Host ""
 }
 
 function Resolve-ProfileFile {
@@ -303,6 +593,17 @@ function Load-ProfileValues {
             $script:Password = Get-ProfileValue -Map $profileMap -Key "PASSWORD"
         }
     }
+
+    if (-not $PSBoundParameters.ContainsKey("ProxyType")) {
+        $profileProxyType = (Get-ProfileValue -Map $profileMap -Key "PROXY_TYPE" -Fallback "no").ToLowerInvariant()
+        if ($profileProxyType -in @("no", "socks5", "http")) {
+            $script:ProxyType = $profileProxyType
+        }
+    }
+
+    if (-not $PSBoundParameters.ContainsKey("ProxySpec")) {
+        $script:ProxySpec = Get-ProfileValue -Map $profileMap -Key "PROXY_SPEC"
+    }
 }
 
 function Ensure-RequiredConnectionValues {
@@ -320,6 +621,18 @@ function Ensure-RequiredConnectionValues {
     if ($missing.Count -eq 0) {
         if ([string]::IsNullOrWhiteSpace($script:HostAlias)) {
             $script:HostAlias = "myvps"
+        }
+        if ($script:AuthMode -eq "password" -and [string]::IsNullOrWhiteSpace($script:Password)) {
+            throw "auth mode 'password' requires a saved password in the profile (PASSWORD_B64) or -Password."
+        }
+        if ([string]::IsNullOrWhiteSpace($script:ProxyType)) {
+            $script:ProxyType = "no"
+        }
+        if ($script:ProxyType -notin @("no", "socks5", "http")) {
+            throw "invalid proxy type: $script:ProxyType (expected no|socks5|http)"
+        }
+        if ($script:ProxyType -ne "no" -and [string]::IsNullOrWhiteSpace($script:ProxySpec)) {
+            throw "proxy is enabled but proxy spec is empty."
         }
         return
     }
@@ -396,17 +709,13 @@ function Select-SshBackend {
         return
     }
 
-    $plink = Get-Command plink -ErrorAction SilentlyContinue
-    $pscp = Get-Command pscp -ErrorAction SilentlyContinue
-
-    if ($plink -and $pscp) {
+    if (Ensure-PuttyTools) {
         $script:SshBackend = "putty"
         Write-Host "using plink/pscp backend for non-interactive password reconnects."
         return
     }
 
-    $script:SshBackend = "openssh"
-    Write-Host "password auth selected without plink/pscp; OpenSSH will prompt for password on reconnect."
+    throw "password auth requires plink/pscp for non-interactive reconnects on Windows. install PuTTY (or rerun quick-install) or switch to key/auto auth."
 }
 
 function Get-LocalCodexAuthPath {
@@ -437,12 +746,16 @@ function Invoke-RemoteSsh {
             $args += @("-pw", $Password)
         }
 
+        if ($script:ProxyType -ne "no" -and -not [string]::IsNullOrWhiteSpace($script:ProxySpec)) {
+            $args += @("-proxycmd", (Build-NcatProxyCommand -TargetHostToken "%host" -TargetPortToken "%port"))
+        }
+
         if ($Interactive) {
-            $args += @($HostName, $RemoteCommand)
-            & plink @args
+            $args += @("-t", $HostName, $RemoteCommand)
+            & $script:PlinkExe @args
         } else {
             $args += @("-batch", $HostName, $RemoteCommand)
-            & plink @args
+            & $script:PlinkExe @args
         }
 
         return $LASTEXITCODE
@@ -474,8 +787,12 @@ function Invoke-RemoteScp {
             $args += @("-pw", $Password)
         }
 
+        if ($script:ProxyType -ne "no" -and -not [string]::IsNullOrWhiteSpace($script:ProxySpec)) {
+            $args += @("-proxycmd", (Build-NcatProxyCommand -TargetHostToken "%host" -TargetPortToken "%port"))
+        }
+
         $args += @($LocalPath, "$HostName`:$RemotePath")
-        & pscp @args
+        & $script:PscpExe @args
         return $LASTEXITCODE
     }
 
@@ -548,23 +865,89 @@ function Write-TempSshConfig {
         }
     }
 
+    if ($script:ProxyType -ne "no" -and -not [string]::IsNullOrWhiteSpace($script:ProxySpec)) {
+        $lines += "    ProxyCommand $(Build-NcatProxyCommand -TargetHostToken '%h' -TargetPortToken '%p')"
+    }
+
     Set-Content -Path $script:SshConfigPath -Value ($lines -join "`r`n")
 }
 
+function Test-RemotePrereqs {
+    $remoteScriptArg = Quote-ForBashSingle $RemoteScript
+    $projectArg = Quote-ForBashSingle $RemoteProjectDir
+    $check = @"
+if [ ! -x $remoteScriptArg ]; then
+  echo "remote script not found or not executable: $RemoteScript" >&2
+  exit 20
+fi
+if [ ! -d $projectArg ]; then
+  echo "remote project directory not found: $RemoteProjectDir" >&2
+  exit 21
+fi
+if ! command -v codex >/dev/null 2>&1; then
+  echo "codex is not installed or not in PATH on the remote host." >&2
+  exit 22
+fi
+"@
+    $cmd = "bash -lc " + (Quote-ForBashSingle $check)
+    $exitCode = Invoke-RemoteSsh -RemoteCommand $cmd
+    if ($exitCode -eq 0) {
+        return
+    }
+
+    if ($exitCode -ge 20 -and $exitCode -le 29) {
+        throw "remote preflight failed with exit code $exitCode."
+    }
+
+    Write-Host "remote preflight could not complete (exit $exitCode). continuing into reconnect loop."
+}
+
 function Start-ReconnectLoop {
+    $rapidFailures = 0
+
     $projectArg = Quote-ForBashSingle $RemoteProjectDir
     $sessionArg = Quote-ForBashSingle $SessionName
     $launchCmd = "$RemoteScript --project-dir $projectArg --session-name $sessionArg --idle-days $IdleDays"
     $remoteCmd = "bash -lc " + (Quote-ForBashSingle $launchCmd)
 
     while ($true) {
+        $startedAt = Get-Date
         Write-Host ""
         Write-Host "connecting to $HostAlias | session=$SessionName | project=$RemoteProjectDir"
-        [void](Invoke-RemoteSsh -Interactive -RemoteCommand $remoteCmd)
+        $exitCode = Invoke-RemoteSsh -Interactive -RemoteCommand $remoteCmd
+        $elapsed = [int]((Get-Date) - $startedAt).TotalSeconds
+
+        $delay = $ReconnectDelaySeconds
+        if ($elapsed -lt 10) {
+            $rapidFailures += 1
+        } else {
+            $rapidFailures = 0
+        }
+
+        if ($rapidFailures -ge 2) {
+            $maxPow = [Math]::Min(5, $rapidFailures - 1)
+            $expDelay = [int]([Math]::Min(60, $ReconnectDelaySeconds * [Math]::Pow(2, $maxPow)))
+            if ($delay -lt $expDelay) {
+                $delay = $expDelay
+            }
+        }
+
+        if ($exitCode -ne 0) {
+            Write-Host "remote launcher exited with code $exitCode."
+        }
+        if ($exitCode -eq 255) {
+            Write-Host "ssh transport failed (exit 255). check sshd/firewall/fail2ban/network reachability."
+            if ($delay -lt 10) {
+                $delay = 10
+            }
+        }
+        if ($rapidFailures -ge 3) {
+            Write-Host "remote session is exiting quickly repeatedly. check remote tmux/codex startup state."
+        }
 
         Write-Host ""
-        Write-Host "disconnected. reconnecting in $ReconnectDelaySeconds seconds..."
-        Start-Sleep -Seconds $ReconnectDelaySeconds
+        Write-Host "disconnected. reconnecting in $delay seconds..."
+        Start-Sleep -Seconds $delay
     }
 }
 
@@ -574,7 +957,7 @@ if ($Help) {
 }
 
 Resolve-ProfileFile
-Ensure-OverridesWhenProfileMissing
+Initialize-ProfileIfMissing
 Load-ProfileValues
 Ensure-RequiredConnectionValues
 
@@ -596,6 +979,7 @@ Ensure-WindowsOpenSsh
 Ensure-Codex
 Write-TempSshConfig
 Select-SshBackend
+Test-RemotePrereqs
 
 if (-not $NoSyncAuth) {
     Sync-LocalCodexAuthToRemote

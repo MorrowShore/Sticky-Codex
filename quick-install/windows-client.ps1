@@ -156,7 +156,7 @@ function Offer-DesktopShortcut {
         [string]$ProfilePath
     )
 
-    $choice = (Prompt-WithDefault -Prompt "create desktop shortcut? (y/N)" -Default "N").ToLowerInvariant()
+    $choice = (Prompt-WithDefault -Prompt "create desktop shortcut? (y/N)" -Default "y").ToLowerInvariant()
     if ($choice -notin @("y", "yes")) {
         return
     }
@@ -253,6 +253,8 @@ function Write-ProfileFile {
         ('REMOTE_SCRIPT="{0}"' -f (Escape-EnvValue $Values.REMOTE_SCRIPT)),
         ('AUTH_MODE="{0}"' -f (Escape-EnvValue $Values.AUTH_MODE)),
         ('PASSWORD_B64="{0}"' -f (Escape-EnvValue $Values.PASSWORD_B64)),
+        ('PROXY_TYPE="{0}"' -f (Escape-EnvValue $Values.PROXY_TYPE)),
+        ('PROXY_SPEC="{0}"' -f (Escape-EnvValue $Values.PROXY_SPEC)),
         'PASSWORD=""'
     )
 
@@ -329,21 +331,34 @@ if ($authMode -eq "password") {
     }
 }
 
-$syncChoice = (Prompt-WithDefault -Prompt "sync local Codex auth.json before attach? (Y/n)" -Default "Y").ToLowerInvariant()
-$syncAuth = if ($syncChoice -in @("n", "no")) { "0" } else { "1" }
-if ($syncAuth -eq "1") {
-    Write-Host "tip: choose manual if you have already done codex login setup."
+    $syncChoice = (Prompt-WithDefault -Prompt "sync local Codex auth.json before attach? (Y/n)" -Default "Y").ToLowerInvariant()
+    $syncAuth = if ($syncChoice -in @("n", "no")) { "0" } else { "1" }
+    if ($syncAuth -eq "1") {
+        Write-Host "tip: choose manual if you have already done codex login setup."
     while ($true) {
         $authSetupMode = (Prompt-WithDefault -Prompt "auth setup mode (manual/auto)" -Default "manual").ToLowerInvariant()
         if ($authSetupMode -in @("manual", "auto")) {
             break
         }
         Write-Host "please enter manual or auto."
+        }
     }
-}
 
-$profileValues = @{
-    HOST_ALIAS = $hostAlias
+    while ($true) {
+        $proxyType = (Prompt-WithDefault -Prompt "Run through proxy? [no]  no/socks5/http" -Default (Get-ProfileValue -Map $profileMap -Key "PROXY_TYPE" -Fallback "no")).ToLowerInvariant()
+        if ($proxyType -in @("no", "socks5", "http")) {
+            break
+        }
+        Write-Host "please enter no, socks5, or http."
+    }
+
+    $proxySpec = ""
+    if ($proxyType -ne "no") {
+        $proxySpec = Prompt-Required -Prompt "proxy address (host:port or host:port:username:password)" -Default (Get-ProfileValue -Map $profileMap -Key "PROXY_SPEC")
+    }
+
+    $profileValues = @{
+        HOST_ALIAS = $hostAlias
     HOST_NAME = $hostName
     USER_NAME = $userName
     PORT = $port
@@ -353,10 +368,12 @@ $profileValues = @{
     IDLE_DAYS = $idleDays
     RECONNECT_DELAY_SECONDS = $reconnectDelay
     SYNC_AUTH = $syncAuth
-    REMOTE_SCRIPT = (Get-ProfileValue -Map $profileMap -Key "REMOTE_SCRIPT" -Fallback "/usr/local/bin/codex-vps")
-    AUTH_MODE = $authMode
-    PASSWORD_B64 = (Encode-Base64 $password)
-}
+        REMOTE_SCRIPT = (Get-ProfileValue -Map $profileMap -Key "REMOTE_SCRIPT" -Fallback "/usr/local/bin/codex-vps")
+        AUTH_MODE = $authMode
+        PASSWORD_B64 = (Encode-Base64 $password)
+        PROXY_TYPE = $proxyType
+        PROXY_SPEC = $proxySpec
+    }
 
 Write-ProfileFile -Path $ProfileFile -Values $profileValues
 Write-Host "saved connection profile: $ProfileFile"

@@ -14,6 +14,8 @@ SYNC_AUTH="1"
 REMOTE_SCRIPT="/usr/local/bin/codex-vps"
 AUTH_MODE="auto"
 PASSWORD=""
+PROXY_TYPE="no"
+PROXY_SPEC=""
 PROFILE_FILE="${CODEX_REMOTE_PROFILE:-$HOME/.config/sticky-codex/connection.env}"
 
 HOST_ALIAS_SET="0"
@@ -29,6 +31,8 @@ SYNC_AUTH_SET="0"
 REMOTE_SCRIPT_SET="0"
 AUTH_MODE_SET="0"
 PASSWORD_SET="0"
+PROXY_TYPE_SET="0"
+PROXY_SPEC_SET="0"
 PROFILE_FILE_SET="0"
 
 usage() {
@@ -48,6 +52,8 @@ options:
   --reconnect-delay-seconds 3
   --auth-mode auto|key|password
   --password VALUE
+  --proxy-type no|socks5|http
+  --proxy-spec host:port[:username:password]
   --profile-file PATH
   --no-sync-auth
   --remote-script /usr/local/bin/codex-vps
@@ -97,6 +103,73 @@ decode_base64() {
   fi
 
   printf '\n'
+}
+
+encode_base64() {
+  local input="$1"
+  if [ -z "$input" ]; then
+    printf '\n'
+    return
+  fi
+
+  printf '%s' "$input" | base64 | tr -d '\n'
+  printf '\n'
+}
+
+parse_proxy_spec() {
+  local spec="$1"
+  local host port user pass extra
+
+  IFS=':' read -r host port user pass extra <<EOF
+$spec
+EOF
+
+  if [ -z "$host" ] || [ -z "$port" ]; then
+    echo "invalid proxy spec. expected host:port or host:port:username:password" >&2
+    exit 1
+  fi
+
+  if [ -n "$extra" ] || { [ -n "$user" ] && [ -z "$pass" ]; }; then
+    echo "invalid proxy spec. expected host:port or host:port:username:password" >&2
+    exit 1
+  fi
+
+  PROXY_HOST="$host"
+  PROXY_PORT="$port"
+  PROXY_USER="${user:-}"
+  PROXY_PASS="${pass:-}"
+}
+
+build_proxy_command() {
+  local target_host="$1"
+  local target_port="$2"
+
+  if [ "$PROXY_TYPE" = "no" ] || [ -z "$PROXY_SPEC" ]; then
+    printf '\n'
+    return
+  fi
+
+  parse_proxy_spec "$PROXY_SPEC"
+
+  if ! has_command ncat; then
+    echo "proxy mode requires ncat in PATH." >&2
+    exit 1
+  fi
+
+  local type cmd
+  if [ "$PROXY_TYPE" = "socks5" ]; then
+    type="socks5"
+  else
+    type="http"
+  fi
+
+  cmd="ncat --proxy ${PROXY_HOST}:${PROXY_PORT} --proxy-type ${type}"
+  if [ -n "$PROXY_USER" ]; then
+    cmd="$cmd --proxy-auth ${PROXY_USER}:${PROXY_PASS}"
+  fi
+  cmd="$cmd ${target_host} ${target_port}"
+
+  printf '%s\n' "$cmd"
 }
 
 read_profile_value() {
@@ -192,6 +265,16 @@ load_profile_if_present() {
     else
       PASSWORD="${PASSWORD:-$(read_profile_value PASSWORD)}"
     fi
+  fi
+  if [ "$PROXY_TYPE_SET" = "0" ]; then
+    local profile_proxy_type
+    profile_proxy_type="$(read_profile_value PROXY_TYPE)"
+    if [ -n "$profile_proxy_type" ]; then
+      PROXY_TYPE="$(printf '%s' "$profile_proxy_type" | tr '[:upper:]' '[:lower:]')"
+    fi
+  fi
+  if [ "$PROXY_SPEC_SET" = "0" ]; then
+    PROXY_SPEC="${PROXY_SPEC:-$(read_profile_value PROXY_SPEC)}"
   fi
   if [ "$SYNC_AUTH_SET" = "0" ]; then
     local profile_sync_auth
@@ -293,6 +376,106 @@ resolve_profile_file() {
   fi
 }
 
+write_profile_file() {
+  local profile_dir
+  profile_dir="$(dirname "$PROFILE_FILE")"
+  mkdir -p "$profile_dir"
+  chmod 700 "$profile_dir" 2>/dev/null || true
+
+  {
+    printf '# sticky-codex connection profile\n'
+    printf 'HOST_ALIAS="%s"\n' "$HOST_ALIAS"
+    printf 'HOST_NAME="%s"\n' "$HOST_NAME"
+    printf 'USER_NAME="%s"\n' "$USER_NAME"
+    printf 'PORT="%s"\n' "$PORT"
+    printf 'IDENTITY_FILE="%s"\n' "$IDENTITY_FILE"
+    printf 'REMOTE_PROJECT_DIR="%s"\n' "$REMOTE_PROJECT_DIR"
+    printf 'SESSION_NAME="%s"\n' "$SESSION_NAME"
+    printf 'IDLE_DAYS="%s"\n' "$IDLE_DAYS"
+    printf 'RECONNECT_DELAY_SECONDS="%s"\n' "$RECONNECT_DELAY_SECONDS"
+    printf 'SYNC_AUTH="%s"\n' "$SYNC_AUTH"
+    printf 'REMOTE_SCRIPT="%s"\n' "$REMOTE_SCRIPT"
+    printf 'AUTH_MODE="%s"\n' "$AUTH_MODE"
+    printf 'PASSWORD_B64="%s"\n' "$(encode_base64 "$PASSWORD")"
+    printf 'PROXY_TYPE="%s"\n' "$PROXY_TYPE"
+    printf 'PROXY_SPEC="%s"\n' "$PROXY_SPEC"
+    printf 'PASSWORD=""\n'
+  } > "$PROFILE_FILE"
+
+  chmod 600 "$PROFILE_FILE" 2>/dev/null || true
+}
+
+initialize_profile_if_missing() {
+  local sync_choice proxy_choice
+
+  if [ -f "$PROFILE_FILE" ]; then
+    return
+  fi
+
+  if [ -n "$HOST_NAME" ] && [ -n "$USER_NAME" ] && [ -n "$REMOTE_PROJECT_DIR" ]; then
+    return
+  fi
+
+  if [ ! -t 0 ]; then
+    echo "connection profile was not found: $PROFILE_FILE" >&2
+    echo "run quick-install once to create it, or pass one-run overrides." >&2
+    exit 1
+  fi
+
+  echo "connection profile not found. creating one now..."
+
+  HOST_ALIAS="$(prompt_with_default "host alias" "${HOST_ALIAS:-myvps}")"
+  HOST_NAME="$(prompt_required "remote host (ip or domain)" "$HOST_NAME")"
+  USER_NAME="$(prompt_required "remote user" "${USER_NAME:-root}")"
+  PORT="$(prompt_with_default "ssh port" "$PORT")"
+  REMOTE_PROJECT_DIR="$(prompt_required "remote project directory" "$REMOTE_PROJECT_DIR")"
+  SESSION_NAME="$(prompt_with_default "session name (blank for auto)" "$SESSION_NAME")"
+  IDLE_DAYS="$(prompt_with_default "idle days before stale session cleanup" "$IDLE_DAYS")"
+  RECONNECT_DELAY_SECONDS="$(prompt_with_default "reconnect delay seconds" "$RECONNECT_DELAY_SECONDS")"
+  AUTH_MODE="$(normalize_auth_mode "$(prompt_with_default "ssh auth mode (auto/key/password)" "$AUTH_MODE")")"
+
+  if [ "$AUTH_MODE" = "key" ] || [ "$AUTH_MODE" = "auto" ]; then
+    IDENTITY_FILE="$(prompt_with_default "ssh identity file path (optional)" "$IDENTITY_FILE")"
+  fi
+
+  if [ "$AUTH_MODE" = "password" ] && [ -z "$PASSWORD" ]; then
+    read -r -s -p "ssh password (stored in profile): " PASSWORD
+    printf '\n'
+  fi
+
+  sync_choice="$(prompt_with_default "sync local Codex auth.json before attach? (Y/n)" "Y")"
+  case "$(printf '%s' "$sync_choice" | tr '[:upper:]' '[:lower:]')" in
+    n|no)
+      SYNC_AUTH="0"
+      ;;
+    *)
+      SYNC_AUTH="1"
+      ;;
+  esac
+
+  while true; do
+    proxy_choice="$(prompt_with_default "Run through proxy? [no]  no/socks5/http" "$PROXY_TYPE")"
+    PROXY_TYPE="$(printf '%s' "$proxy_choice" | tr '[:upper:]' '[:lower:]')"
+    case "$PROXY_TYPE" in
+      no|socks5|http)
+        break
+        ;;
+      *)
+        echo "please enter no, socks5, or http." >&2
+        ;;
+    esac
+  done
+
+  if [ "$PROXY_TYPE" != "no" ]; then
+    PROXY_SPEC="$(prompt_required "proxy address (host:port or host:port:username:password)" "$PROXY_SPEC")"
+  else
+    PROXY_SPEC=""
+  fi
+
+  write_profile_file
+  echo "saved connection profile: $PROFILE_FILE"
+}
+
 ensure_required_connection_values() {
   local missing=()
   if [ -z "$HOST_NAME" ]; then
@@ -309,6 +492,23 @@ ensure_required_connection_values() {
     [ -n "$HOST_ALIAS" ] || HOST_ALIAS="myvps"
     [ -n "$AUTH_MODE" ] || AUTH_MODE="auto"
     AUTH_MODE="$(normalize_auth_mode "$AUTH_MODE")"
+    if [ "$AUTH_MODE" = "password" ] && [ -z "$PASSWORD" ]; then
+      echo "auth mode 'password' requires a saved password in the profile (PASSWORD_B64) or --password." >&2
+      exit 1
+    fi
+    [ -n "$PROXY_TYPE" ] || PROXY_TYPE="no"
+    case "$PROXY_TYPE" in
+      no|socks5|http)
+        ;;
+      *)
+        echo "invalid proxy type: $PROXY_TYPE (expected no|socks5|http)" >&2
+        exit 1
+        ;;
+    esac
+    if [ "$PROXY_TYPE" != "no" ] && [ -z "$PROXY_SPEC" ]; then
+      echo "proxy is enabled but proxy spec is empty." >&2
+      exit 1
+    fi
     return
   fi
 
@@ -374,6 +574,16 @@ while [ $# -gt 0 ]; do
       PASSWORD_SET="1"
       shift 2
       ;;
+    --proxy-type)
+      PROXY_TYPE="${2:-no}"
+      PROXY_TYPE_SET="1"
+      shift 2
+      ;;
+    --proxy-spec)
+      PROXY_SPEC="${2:-}"
+      PROXY_SPEC_SET="1"
+      shift 2
+      ;;
     --profile-file)
       PROFILE_FILE="${2:-}"
       PROFILE_FILE_SET="1"
@@ -402,6 +612,7 @@ while [ $# -gt 0 ]; do
 done
 
 resolve_profile_file
+initialize_profile_if_missing
 ensure_overrides_when_profile_missing
 load_profile_if_present
 ensure_required_connection_values
@@ -606,6 +817,7 @@ quote_for_bash_single() {
 }
 
 write_temp_ssh_config() {
+  local proxy_command
   {
     printf 'Host %s\n' "$HOST_ALIAS"
     printf '    HostName %s\n' "$HOST_NAME"
@@ -636,11 +848,19 @@ write_temp_ssh_config() {
         fi
         ;;
     esac
+
+    if [ "$PROXY_TYPE" != "no" ] && [ -n "$PROXY_SPEC" ]; then
+      proxy_command="$(build_proxy_command "%h" "%p")"
+      printf '    ProxyCommand %s\n' "$proxy_command"
+    fi
   } > "$SSH_CONFIG_PATH"
 }
 
 start_reconnect_loop() {
-  local project_arg session_arg launch_cmd remote_cmd
+  local project_arg session_arg launch_cmd remote_cmd exit_code delay
+  local started_at elapsed rapid_failures max_pow exp_delay i
+
+  rapid_failures=0
 
   project_arg="$(quote_for_bash_single "$REMOTE_PROJECT_DIR")"
   session_arg="$(quote_for_bash_single "$SESSION_NAME")"
@@ -648,14 +868,84 @@ start_reconnect_loop() {
   remote_cmd="bash -lc $(quote_for_bash_single "$launch_cmd")"
 
   while true; do
+    started_at="$(date +%s)"
     printf '\n'
     printf 'connecting to %s | session=%s | project=%s\n' "$HOST_ALIAS" "$SESSION_NAME" "$REMOTE_PROJECT_DIR"
-    run_ssh -tt -F "$SSH_CONFIG_PATH" "$HOST_ALIAS" "$remote_cmd"
+    if run_ssh -tt -F "$SSH_CONFIG_PATH" "$HOST_ALIAS" "$remote_cmd"; then
+      exit_code=0
+    else
+      exit_code="$?"
+    fi
+    elapsed="$(( $(date +%s) - started_at ))"
+
+    if [ "$elapsed" -lt 10 ]; then
+      rapid_failures="$((rapid_failures + 1))"
+    else
+      rapid_failures=0
+    fi
+
+    delay="$RECONNECT_DELAY_SECONDS"
+    if [ "$rapid_failures" -ge 2 ]; then
+      max_pow="$((rapid_failures - 1))"
+      if [ "$max_pow" -gt 5 ]; then
+        max_pow=5
+      fi
+
+      exp_delay="$RECONNECT_DELAY_SECONDS"
+      i=0
+      while [ "$i" -lt "$max_pow" ]; do
+        exp_delay="$((exp_delay * 2))"
+        if [ "$exp_delay" -ge 60 ]; then
+          exp_delay=60
+          break
+        fi
+        i="$((i + 1))"
+      done
+
+      if [ "$delay" -lt "$exp_delay" ]; then
+        delay="$exp_delay"
+      fi
+    fi
+
+    if [ "$exit_code" -ne 0 ]; then
+      printf 'remote launcher exited with code %s.\n' "$exit_code"
+    fi
+    if [ "$exit_code" -eq 255 ]; then
+      printf 'ssh transport failed (exit 255). check sshd/firewall/fail2ban/network reachability.\n'
+      if [ "$delay" -lt 10 ]; then
+        delay="10"
+      fi
+    fi
+    if [ "$rapid_failures" -ge 3 ]; then
+      printf 'remote session is exiting quickly repeatedly. check remote tmux/codex startup state.\n'
+    fi
 
     printf '\n'
-    printf 'disconnected. reconnecting in %s seconds...\n' "$RECONNECT_DELAY_SECONDS"
-    sleep "$RECONNECT_DELAY_SECONDS"
+    printf 'disconnected. reconnecting in %s seconds...\n' "$delay"
+    sleep "$delay"
   done
+}
+
+test_remote_prereqs() {
+  local remote_script_arg project_arg check_cmd cmd exit_code
+
+  remote_script_arg="$(quote_for_bash_single "$REMOTE_SCRIPT")"
+  project_arg="$(quote_for_bash_single "$REMOTE_PROJECT_DIR")"
+  check_cmd="if [ ! -x $remote_script_arg ]; then echo 'remote script not found or not executable: $REMOTE_SCRIPT' >&2; exit 20; fi; if [ ! -d $project_arg ]; then echo 'remote project directory not found: $REMOTE_PROJECT_DIR' >&2; exit 21; fi"
+  check_cmd="$check_cmd; if ! command -v codex >/dev/null 2>&1; then echo 'codex is not installed or not in PATH on the remote host.' >&2; exit 22; fi"
+  cmd="bash -lc $(quote_for_bash_single "$check_cmd")"
+
+  if run_ssh -F "$SSH_CONFIG_PATH" "$HOST_ALIAS" "$cmd"; then
+    return
+  fi
+  exit_code="$?"
+
+  if [ "$exit_code" -ge 20 ] && [ "$exit_code" -le 29 ]; then
+    echo "remote preflight failed with exit code $exit_code." >&2
+    exit 1
+  fi
+
+  echo "remote preflight could not complete (exit $exit_code). continuing into reconnect loop."
 }
 
 if [ -z "$SESSION_NAME" ]; then
@@ -673,6 +963,7 @@ SSH_CONFIG_PATH="$(mktemp)"
 trap 'rm -f "$SSH_CONFIG_PATH"' EXIT
 
 write_temp_ssh_config
+test_remote_prereqs
 
 if [ "$SYNC_AUTH" = "1" ]; then
   sync_local_codex_auth_to_remote

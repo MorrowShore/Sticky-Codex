@@ -181,6 +181,12 @@ export CODEX_HOME=$(printf '%q' "$CODEX_HOME")
 cd $(printf '%q' "$PROJECT_DIR")
 if [ -f $(printf '%q' "$CODEX_HOME/auth.json") ]; then
   $CODEX_CMD resume --last || $CODEX_CMD
+  code=\$?
+  echo
+  echo "codex exited with code \$code. leaving shell open for troubleshooting."
+  echo "restart manually with: $CODEX_CMD resume --last || $CODEX_CMD"
+  echo
+  exec bash -li
 else
   echo
   echo "no codex auth found at $CODEX_HOME/auth.json"

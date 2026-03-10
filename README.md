@@ -14,7 +14,7 @@ Support: https://morrowshore.com
 
 ## Quick install
 
-These scripts download the launchers and then prompt for missing remote destination/auth values. Client installers can write a reusable connection profile so later runs can start with no flags.
+These scripts download the launchers and then prompt for remote destination/auth values, proxy settings, and install location (`default`/`here`). Client installers write a reusable connection profile so later runs can start with no flags.
 
 ### remote Linux server
 
@@ -138,4 +138,9 @@ Both client launchers support:
 
 password-mode reconnect behavior:
 - Linux: if password is configured, launcher tries to use `sshpass` for non-interactive reconnects.
-- Windows: if `plink` and `pscp` are available, launcher uses them for non-interactive password reconnects; otherwise OpenSSH password prompts are used.
+- Windows: launcher requires `plink`/`pscp` for non-interactive reconnects. It auto-checks PATH, standard PuTTY install paths, `winget` install, then portable download to `%LOCALAPPDATA%\sticky-codex\tools`.
+- both launchers require a saved password value when `auth mode = password`.
+
+proxy mode:
+- both client launchers can prompt for `no|socks5|http`
+- proxy format is `host:port` or `host:port:username:password`

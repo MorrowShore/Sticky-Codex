@@ -201,6 +201,8 @@ write_profile() {
     printf 'REMOTE_SCRIPT="%s"\n' "$(quote_env_value "$REMOTE_SCRIPT")"
     printf 'AUTH_MODE="%s"\n' "$(quote_env_value "$AUTH_MODE")"
     printf 'PASSWORD_B64="%s"\n' "$(quote_env_value "$(encode_base64 "$PASSWORD")")"
+    printf 'PROXY_TYPE="%s"\n' "$(quote_env_value "$PROXY_TYPE")"
+    printf 'PROXY_SPEC="%s"\n' "$(quote_env_value "$PROXY_SPEC")"
     printf 'PASSWORD=""\n'
   } > "$PROFILE_FILE"
 
@@ -259,6 +261,25 @@ collect_profile_inputs() {
     printf 'tip: choose manual if you have already done codex login setup.\n'
   fi
 
+  while true; do
+    PROXY_TYPE="$(prompt_with_default "Run through proxy? [no]  no/socks5/http" "$PROXY_TYPE")"
+    PROXY_TYPE="$(printf '%s' "$PROXY_TYPE" | tr '[:upper:]' '[:lower:]')"
+    case "$PROXY_TYPE" in
+      no|socks5|http)
+        break
+        ;;
+      *)
+        echo "please enter no, socks5, or http." >&2
+        ;;
+    esac
+  done
+
+  if [ "$PROXY_TYPE" != "no" ]; then
+    PROXY_SPEC="$(prompt_required "proxy address (host:port or host:port:username:password)" "$PROXY_SPEC")"
+  else
+    PROXY_SPEC=""
+  fi
+
   write_profile
   printf 'saved connection profile: %s\n' "$PROFILE_FILE"
 }
@@ -281,6 +302,8 @@ load_defaults_from_existing_profile() {
   if [ -z "$PASSWORD" ]; then
     PASSWORD="$(read_profile_value "$PROFILE_FILE" PASSWORD)"
   fi
+  PROXY_TYPE="$(read_profile_value "$PROFILE_FILE" PROXY_TYPE)"
+  PROXY_SPEC="$(read_profile_value "$PROFILE_FILE" PROXY_SPEC)"
 
   [ -n "$HOST_ALIAS" ] || HOST_ALIAS="myvps"
   [ -n "$PORT" ] || PORT="22"
@@ -289,6 +312,7 @@ load_defaults_from_existing_profile() {
   [ -n "$SYNC_AUTH" ] || SYNC_AUTH="1"
   [ -n "$REMOTE_SCRIPT" ] || REMOTE_SCRIPT="/usr/local/bin/codex-vps"
   [ -n "$AUTH_MODE" ] || AUTH_MODE="auto"
+  [ -n "$PROXY_TYPE" ] || PROXY_TYPE="no"
 }
 
 choose_install_target "$@"
