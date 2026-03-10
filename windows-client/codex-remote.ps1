@@ -210,6 +210,118 @@ function Invoke-WithRetry {
     return $false
 }
 
+function Get-TextTail {
+    param(
+        [string]$Text,
+        [int]$MaxLines = 12
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return ""
+    }
+
+    $lines = $Text -split "(`r`n|`n|`r)"
+    $trimmed = @($lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($trimmed.Count -le $MaxLines) {
+        return ($trimmed -join " | ")
+    }
+
+    $tail = $trimmed[($trimmed.Count - $MaxLines)..($trimmed.Count - 1)]
+    return ($tail -join " | ")
+}
+
+function Classify-WingetFailure {
+    param(
+        [string]$Output,
+        [int]$ExitCode
+    )
+
+    $text = ""
+    if (-not [string]::IsNullOrWhiteSpace($Output)) {
+        $text = $Output.ToLowerInvariant()
+    }
+
+    if ($text -match "no internet|internet connection|timed out|timeout|unable to connect|could not connect|could not resolve|name resolution|connection reset|connection refused|network") {
+        return @{
+            Kind = "network"
+            Summary = "likely unstable internet/proxy/DNS path to winget sources."
+        }
+    }
+
+    if ($text -match "group policy|administrator has blocked|disabled by policy|access is denied|permission denied|elevation|required") {
+        return @{
+            Kind = "policy-or-permission"
+            Summary = "winget appears blocked by policy or insufficient permissions."
+        }
+    }
+
+    if ($text -match "app installer|winget.exe|not recognized|not found") {
+        return @{
+            Kind = "winget-unavailable"
+            Summary = "winget/App Installer is missing or not usable on this system."
+        }
+    }
+
+    if ($text -match "source|msstore|agreement|hash does not match|installer hash") {
+        return @{
+            Kind = "winget-source"
+            Summary = "winget source/index/package retrieval failed."
+        }
+    }
+
+    return @{
+        Kind = "unknown"
+        Summary = "winget failed for an unknown reason."
+    }
+}
+
+function Invoke-WingetInstallWithRetry {
+    param(
+        [string]$PackageId,
+        [int]$Attempts = 4,
+        [int]$BaseDelaySeconds = 10
+    )
+
+    $lastOutput = ""
+    $lastExitCode = 0
+    $lastDiag = @{
+        Kind = "unknown"
+        Summary = "winget failed for an unknown reason."
+    }
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        $output = (& winget install --id $PackageId -e --accept-package-agreements --accept-source-agreements --silent 2>&1 | Out-String)
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -eq 0) {
+            return @{
+                Success = $true
+                ExitCode = 0
+                Kind = "ok"
+                Summary = "installed successfully."
+                Tail = ""
+            }
+        }
+
+        $lastOutput = $output
+        $lastExitCode = $exitCode
+        $lastDiag = Classify-WingetFailure -Output $output -ExitCode $exitCode
+
+        if ($attempt -lt $Attempts) {
+            $delay = [Math]::Min(30, $BaseDelaySeconds * $attempt)
+            Write-Host "winget install $PackageId failed (attempt $attempt/$Attempts). cause=$($lastDiag.Kind). retrying in $delay seconds..."
+            Start-Sleep -Seconds $delay
+        }
+    }
+
+    return @{
+        Success = $false
+        ExitCode = $lastExitCode
+        Kind = $lastDiag.Kind
+        Summary = $lastDiag.Summary
+        Tail = (Get-TextTail -Text $lastOutput -MaxLines 12)
+    }
+}
+
 function Escape-ProfileValue {
     param([string]$Value)
 
@@ -337,17 +449,28 @@ function Ensure-NcatForProxy {
     }
 
     $winget = Get-Command winget -ErrorAction SilentlyContinue
+    $wingetResult = $null
     if ($winget) {
         Write-Host "proxy mode requires ncat. attempting install via winget (Nmap)..."
-        $null = Invoke-WithRetry -Label "winget install Nmap.Nmap" -Attempts 4 -BaseDelaySeconds 10 -Action {
-            & winget install --id Nmap.Nmap -e --accept-package-agreements --accept-source-agreements --silent | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                throw "winget exited with code $LASTEXITCODE"
+        $wingetResult = Invoke-WingetInstallWithRetry -PackageId "Nmap.Nmap" -Attempts 6 -BaseDelaySeconds 10
+        if (-not $wingetResult.Success) {
+            Write-Host "winget install Nmap.Nmap failed after retries."
+            Write-Host "diagnosis: $($wingetResult.Summary) (kind=$($wingetResult.Kind), exit=$($wingetResult.ExitCode))"
+            if (-not [string]::IsNullOrWhiteSpace($wingetResult.Tail)) {
+                Write-Host "winget output tail: $($wingetResult.Tail)"
             }
         }
     }
 
     if (-not (Resolve-NcatExe)) {
+        if (-not $winget) {
+            throw "proxy mode requires ncat, and winget is not available on this machine. install Nmap (ncat) manually, then retry."
+        }
+
+        if ($wingetResult -and -not $wingetResult.Success) {
+            throw "proxy mode requires ncat. auto-install failed due to $($wingetResult.Kind): $($wingetResult.Summary)"
+        }
+
         throw "proxy mode requires ncat. install Nmap (ncat), then retry."
     }
 }
@@ -456,10 +579,12 @@ function Ensure-PuttyTools {
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if ($winget) {
         Write-Host "plink/pscp not found. attempting to install PuTTY with winget..."
-        $null = Invoke-WithRetry -Label "winget install PuTTY.PuTTY" -Attempts 4 -BaseDelaySeconds 8 -Action {
-            & winget install --id PuTTY.PuTTY -e --accept-package-agreements --accept-source-agreements --silent | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                throw "winget exited with code $LASTEXITCODE"
+        $wingetResult = Invoke-WingetInstallWithRetry -PackageId "PuTTY.PuTTY" -Attempts 6 -BaseDelaySeconds 8
+        if (-not $wingetResult.Success) {
+            Write-Host "winget install PuTTY.PuTTY failed after retries."
+            Write-Host "diagnosis: $($wingetResult.Summary) (kind=$($wingetResult.Kind), exit=$($wingetResult.ExitCode))"
+            if (-not [string]::IsNullOrWhiteSpace($wingetResult.Tail)) {
+                Write-Host "winget output tail: $($wingetResult.Tail)"
             }
         }
 

@@ -20,6 +20,7 @@ These scripts download the launchers and then prompt for remote destination/auth
 download resilience:
 - quick-install scripts use higher network timeouts plus retry/backoff before failing.
 - runtime dependency fetches (PuTTY/Nmap on Windows) also retry before fatal errors.
+- Windows runtime install failures now print a diagnosis (`network`, `winget-unavailable`, `policy-or-permission`, `winget-source`) plus winget output tail.
 
 ### remote Linux server
 
