@@ -79,6 +79,26 @@ normalize_auth_mode() {
   esac
 }
 
+decode_base64() {
+  local input="$1"
+  if [ -z "$input" ]; then
+    printf '\n'
+    return
+  fi
+
+  if printf '%s' "$input" | base64 -d >/dev/null 2>&1; then
+    printf '%s' "$input" | base64 -d
+    return
+  fi
+
+  if printf '%s' "$input" | base64 --decode >/dev/null 2>&1; then
+    printf '%s' "$input" | base64 --decode
+    return
+  fi
+
+  printf '\n'
+}
+
 read_profile_value() {
   local wanted_key="$1"
 
@@ -164,7 +184,14 @@ load_profile_if_present() {
     fi
   fi
   if [ "$PASSWORD_SET" = "0" ]; then
-    PASSWORD="${PASSWORD:-$(read_profile_value PASSWORD)}"
+    local profile_password_b64 profile_password_plain
+    profile_password_b64="$(read_profile_value PASSWORD_B64)"
+    profile_password_plain="$(decode_base64 "$profile_password_b64")"
+    if [ -n "$profile_password_plain" ]; then
+      PASSWORD="$profile_password_plain"
+    else
+      PASSWORD="${PASSWORD:-$(read_profile_value PASSWORD)}"
+    fi
   fi
   if [ "$SYNC_AUTH_SET" = "0" ]; then
     local profile_sync_auth
@@ -211,32 +238,6 @@ prompt_required() {
   done
 }
 
-prompt_for_missing_inputs() {
-  if [ -z "$HOST_NAME" ]; then
-    HOST_NAME="$(prompt_required "remote host (ip or domain)" "$HOST_NAME")"
-  fi
-  if [ -z "$USER_NAME" ]; then
-    USER_NAME="$(prompt_required "remote user" "${USER_NAME:-root}")"
-  fi
-  if [ -z "$REMOTE_PROJECT_DIR" ]; then
-    REMOTE_PROJECT_DIR="$(prompt_required "remote project directory" "$REMOTE_PROJECT_DIR")"
-  fi
-
-  if [ -z "$HOST_ALIAS" ]; then
-    HOST_ALIAS="myvps"
-  fi
-
-  if [ -z "$AUTH_MODE" ]; then
-    AUTH_MODE="auto"
-  fi
-  AUTH_MODE="$(normalize_auth_mode "$AUTH_MODE")"
-
-  if [ "$AUTH_MODE" = "password" ] && [ -z "$PASSWORD" ]; then
-    read -r -s -p "ssh password: " PASSWORD
-    printf '\n'
-  fi
-}
-
 ensure_overrides_when_profile_missing() {
   if [ -f "$PROFILE_FILE" ]; then
     return
@@ -264,6 +265,30 @@ ensure_overrides_when_profile_missing() {
   echo "  --host-name your.vps.host --user-name root --remote-project-dir /srv/project" >&2
   echo >&2
   echo "missing required override(s): ${missing[*]}" >&2
+  exit 1
+}
+
+ensure_required_connection_values() {
+  local missing=()
+  if [ -z "$HOST_NAME" ]; then
+    missing+=("--host-name")
+  fi
+  if [ -z "$USER_NAME" ]; then
+    missing+=("--user-name")
+  fi
+  if [ -z "$REMOTE_PROJECT_DIR" ]; then
+    missing+=("--remote-project-dir")
+  fi
+
+  if [ "${#missing[@]}" -eq 0 ]; then
+    [ -n "$HOST_ALIAS" ] || HOST_ALIAS="myvps"
+    [ -n "$AUTH_MODE" ] || AUTH_MODE="auto"
+    AUTH_MODE="$(normalize_auth_mode "$AUTH_MODE")"
+    return
+  fi
+
+  echo "missing required remote connection value(s): ${missing[*]}" >&2
+  echo "run quick-install again to populate $PROFILE_FILE, or pass one-run overrides." >&2
   exit 1
 }
 
@@ -353,7 +378,7 @@ done
 
 ensure_overrides_when_profile_missing
 load_profile_if_present
-prompt_for_missing_inputs
+ensure_required_connection_values
 
 if [ -z "$HOST_NAME" ] || [ -z "$USER_NAME" ] || [ -z "$REMOTE_PROJECT_DIR" ]; then
   usage >&2

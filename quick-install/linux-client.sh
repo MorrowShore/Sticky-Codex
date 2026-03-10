@@ -145,6 +145,37 @@ normalize_auth_mode() {
   esac
 }
 
+encode_base64() {
+  local input="$1"
+  if [ -z "$input" ]; then
+    printf '\n'
+    return
+  fi
+
+  printf '%s' "$input" | base64 | tr -d '\n'
+  printf '\n'
+}
+
+decode_base64() {
+  local input="$1"
+  if [ -z "$input" ]; then
+    printf '\n'
+    return
+  fi
+
+  if printf '%s' "$input" | base64 -d >/dev/null 2>&1; then
+    printf '%s' "$input" | base64 -d
+    return
+  fi
+
+  if printf '%s' "$input" | base64 --decode >/dev/null 2>&1; then
+    printf '%s' "$input" | base64 --decode
+    return
+  fi
+
+  printf '\n'
+}
+
 quote_env_value() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
@@ -169,21 +200,14 @@ write_profile() {
     printf 'SYNC_AUTH="%s"\n' "$(quote_env_value "$SYNC_AUTH")"
     printf 'REMOTE_SCRIPT="%s"\n' "$(quote_env_value "$REMOTE_SCRIPT")"
     printf 'AUTH_MODE="%s"\n' "$(quote_env_value "$AUTH_MODE")"
-    printf 'PASSWORD="%s"\n' "$(quote_env_value "$PASSWORD")"
+    printf 'PASSWORD_B64="%s"\n' "$(quote_env_value "$(encode_base64 "$PASSWORD")")"
+    printf 'PASSWORD=""\n'
   } > "$PROFILE_FILE"
 
   chmod 600 "$PROFILE_FILE" 2>/dev/null || true
 }
 
 collect_profile_inputs() {
-  local setup_choice
-  setup_choice="$(prompt_with_default "configure remote connection profile now? (Y/n)" "Y")"
-  case "$(printf '%s' "$setup_choice" | tr '[:upper:]' '[:lower:]')" in
-    n|no)
-      return
-      ;;
-  esac
-
   printf '%s\n' "$RULE"
   printf 'remote connection setup\n'
   printf '%s\n' "$RULE"
@@ -205,8 +229,17 @@ collect_profile_inputs() {
   fi
 
   if [ "$AUTH_MODE" = "password" ]; then
-    read -r -s -p "ssh password (stored in profile): " PASSWORD
-    printf '\n'
+    if [ -n "$PASSWORD" ]; then
+      read -r -s -p "ssh password (stored in profile) [previous password]: " PASSWORD_INPUT
+      printf '\n'
+      if [ -n "$PASSWORD_INPUT" ]; then
+        PASSWORD="$PASSWORD_INPUT"
+      fi
+    else
+      read -r -s -p "ssh password (stored in profile): " PASSWORD
+      printf '\n'
+    fi
+    unset PASSWORD_INPUT
   else
     PASSWORD=""
   fi
@@ -221,6 +254,10 @@ collect_profile_inputs() {
       SYNC_AUTH="1"
       ;;
   esac
+
+  if [ "$SYNC_AUTH" = "1" ]; then
+    printf 'tip: choose manual if you have already done codex login setup.\n'
+  fi
 
   write_profile
   printf 'saved connection profile: %s\n' "$PROFILE_FILE"
@@ -239,7 +276,11 @@ load_defaults_from_existing_profile() {
   SYNC_AUTH="$(read_profile_value "$PROFILE_FILE" SYNC_AUTH)"
   REMOTE_SCRIPT="$(read_profile_value "$PROFILE_FILE" REMOTE_SCRIPT)"
   AUTH_MODE="$(read_profile_value "$PROFILE_FILE" AUTH_MODE)"
-  PASSWORD="$(read_profile_value "$PROFILE_FILE" PASSWORD)"
+  PASSWORD_B64="$(read_profile_value "$PROFILE_FILE" PASSWORD_B64)"
+  PASSWORD="$(decode_base64 "$PASSWORD_B64")"
+  if [ -z "$PASSWORD" ]; then
+    PASSWORD="$(read_profile_value "$PROFILE_FILE" PASSWORD)"
+  fi
 
   [ -n "$HOST_ALIAS" ] || HOST_ALIAS="myvps"
   [ -n "$PORT" ] || PORT="22"

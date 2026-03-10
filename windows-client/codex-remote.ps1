@@ -150,6 +150,21 @@ function Get-ProfileValue {
     return $Fallback
 }
 
+function Decode-Base64 {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return ""
+    }
+
+    try {
+        $bytes = [Convert]::FromBase64String($Text)
+        return [System.Text.Encoding]::UTF8.GetString($bytes)
+    } catch {
+        return ""
+    }
+}
+
 function Prompt-WithDefault {
     param(
         [string]$Prompt,
@@ -260,41 +275,35 @@ function Load-ProfileValues {
     }
 
     if (-not $PSBoundParameters.ContainsKey("Password")) {
-        $Password = Get-ProfileValue -Map $profileMap -Key "PASSWORD"
+        $Password = Decode-Base64 (Get-ProfileValue -Map $profileMap -Key "PASSWORD_B64")
+        if ([string]::IsNullOrWhiteSpace($Password)) {
+            $Password = Get-ProfileValue -Map $profileMap -Key "PASSWORD"
+        }
     }
 }
 
-function Prompt-ForMissingInputs {
+function Ensure-RequiredConnectionValues {
+    $missing = @()
     if ([string]::IsNullOrWhiteSpace($HostName)) {
-        $HostName = Prompt-Required -Prompt "remote host (ip or domain)" -Default $HostName
+        $missing += "-HostName"
     }
-
     if ([string]::IsNullOrWhiteSpace($UserName)) {
-        $defaultUserName = if ([string]::IsNullOrWhiteSpace($UserName)) { "root" } else { $UserName }
-        $UserName = Prompt-Required -Prompt "remote user" -Default $defaultUserName
+        $missing += "-UserName"
     }
-
     if ([string]::IsNullOrWhiteSpace($RemoteProjectDir)) {
-        $RemoteProjectDir = Prompt-Required -Prompt "remote project directory" -Default $RemoteProjectDir
+        $missing += "-RemoteProjectDir"
     }
 
-    if ([string]::IsNullOrWhiteSpace($HostAlias)) {
-        $HostAlias = "myvps"
-    }
-
-    if ([string]::IsNullOrWhiteSpace($AuthMode)) {
-        $AuthMode = "auto"
-    }
-
-    if ($AuthMode -eq "password" -and [string]::IsNullOrWhiteSpace($Password)) {
-        $secure = Read-Host "ssh password" -AsSecureString
-        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-        try {
-            $Password = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-        } finally {
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    if ($missing.Count -eq 0) {
+        if ([string]::IsNullOrWhiteSpace($HostAlias)) {
+            $HostAlias = "myvps"
         }
+        return
     }
+
+    Write-Host "missing required remote connection value(s): $($missing -join ', ')"
+    Write-Host "run quick-install again to populate $ProfileFile, or pass one-run overrides."
+    exit 1
 }
 
 function Ensure-OverridesWhenProfileMissing {
@@ -543,7 +552,7 @@ if ($Help) {
 
 Ensure-OverridesWhenProfileMissing
 Load-ProfileValues
-Prompt-ForMissingInputs
+Ensure-RequiredConnectionValues
 
 if ([string]::IsNullOrWhiteSpace($HostName) -or [string]::IsNullOrWhiteSpace($UserName) -or [string]::IsNullOrWhiteSpace($RemoteProjectDir)) {
     Show-Usage

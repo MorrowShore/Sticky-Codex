@@ -57,6 +57,31 @@ function Get-ProfileValue {
     return $Fallback
 }
 
+function Encode-Base64 {
+    param([string]$Text)
+
+    if ([string]::IsNullOrEmpty($Text)) {
+        return ""
+    }
+
+    return [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text))
+}
+
+function Decode-Base64 {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return ""
+    }
+
+    try {
+        $bytes = [Convert]::FromBase64String($Text)
+        return [System.Text.Encoding]::UTF8.GetString($bytes)
+    } catch {
+        return ""
+    }
+}
+
 function Prompt-WithDefault {
     param(
         [string]$Prompt,
@@ -179,7 +204,7 @@ function Resolve-InstallTarget {
                 return
             }
             "here" {
-                $Target = Join-Path (Get-Location).Path "codex-remote.ps1"
+                $script:Target = Join-Path (Get-Location).Path "codex-remote.ps1"
                 return
             }
             default {
@@ -224,7 +249,8 @@ function Write-ProfileFile {
         ('SYNC_AUTH="{0}"' -f (Escape-EnvValue $Values.SYNC_AUTH)),
         ('REMOTE_SCRIPT="{0}"' -f (Escape-EnvValue $Values.REMOTE_SCRIPT)),
         ('AUTH_MODE="{0}"' -f (Escape-EnvValue $Values.AUTH_MODE)),
-        ('PASSWORD="{0}"' -f (Escape-EnvValue $Values.PASSWORD))
+        ('PASSWORD_B64="{0}"' -f (Escape-EnvValue $Values.PASSWORD_B64)),
+        'PASSWORD=""'
     )
 
     Set-Content -Path $Path -Value ($lines -join "`r`n")
@@ -244,82 +270,94 @@ Write-Host ""
 $profileMap = Read-ProfileMap -Path $ProfileFile
 $syncAuth = Get-ProfileValue -Map $profileMap -Key "SYNC_AUTH" -Fallback "1"
 $authSetupMode = "manual"
-$shouldSetup = (Prompt-WithDefault -Prompt "configure remote connection profile now? (Y/n)" -Default "Y").ToLowerInvariant()
-if ($shouldSetup -notin @("n", "no")) {
-    Write-Rule
-    Write-Host "remote connection setup"
-    Write-Rule
-    $hostAlias = Prompt-WithDefault -Prompt "host alias" -Default (Get-ProfileValue -Map $profileMap -Key "HOST_ALIAS" -Fallback "myvps")
-    $hostName = Prompt-Required -Prompt "remote host (ip or domain)" -Default (Get-ProfileValue -Map $profileMap -Key "HOST_NAME")
-    $userName = Prompt-Required -Prompt "remote user" -Default (Get-ProfileValue -Map $profileMap -Key "USER_NAME" -Fallback "root")
-    $port = Prompt-WithDefault -Prompt "ssh port" -Default (Get-ProfileValue -Map $profileMap -Key "PORT" -Fallback "22")
-    $remoteProjectDir = Prompt-Required -Prompt "remote project directory" -Default (Get-ProfileValue -Map $profileMap -Key "REMOTE_PROJECT_DIR")
-    $sessionName = Prompt-WithDefault -Prompt "session name (blank for auto)" -Default (Get-ProfileValue -Map $profileMap -Key "SESSION_NAME")
-    $idleDays = Prompt-WithDefault -Prompt "idle days before stale session cleanup" -Default (Get-ProfileValue -Map $profileMap -Key "IDLE_DAYS" -Fallback "7")
-    $reconnectDelay = Prompt-WithDefault -Prompt "reconnect delay seconds" -Default (Get-ProfileValue -Map $profileMap -Key "RECONNECT_DELAY_SECONDS" -Fallback "3")
+Write-Rule
+Write-Host "remote connection setup"
+Write-Rule
+$hostAlias = Prompt-WithDefault -Prompt "host alias" -Default (Get-ProfileValue -Map $profileMap -Key "HOST_ALIAS" -Fallback "myvps")
+$hostName = Prompt-Required -Prompt "remote host (ip or domain)" -Default (Get-ProfileValue -Map $profileMap -Key "HOST_NAME")
+$userName = Prompt-Required -Prompt "remote user" -Default (Get-ProfileValue -Map $profileMap -Key "USER_NAME" -Fallback "root")
+$port = Prompt-WithDefault -Prompt "ssh port" -Default (Get-ProfileValue -Map $profileMap -Key "PORT" -Fallback "22")
+$remoteProjectDir = Prompt-Required -Prompt "remote project directory" -Default (Get-ProfileValue -Map $profileMap -Key "REMOTE_PROJECT_DIR")
+$sessionName = Prompt-WithDefault -Prompt "session name (blank for auto)" -Default (Get-ProfileValue -Map $profileMap -Key "SESSION_NAME")
+$idleDays = Prompt-WithDefault -Prompt "idle days before stale session cleanup" -Default (Get-ProfileValue -Map $profileMap -Key "IDLE_DAYS" -Fallback "7")
+$reconnectDelay = Prompt-WithDefault -Prompt "reconnect delay seconds" -Default (Get-ProfileValue -Map $profileMap -Key "RECONNECT_DELAY_SECONDS" -Fallback "3")
 
-    $authModeDefault = (Get-ProfileValue -Map $profileMap -Key "AUTH_MODE" -Fallback "auto").ToLowerInvariant()
-    if ($authModeDefault -notin @("auto", "key", "password")) {
-        $authModeDefault = "auto"
+$authModeDefault = (Get-ProfileValue -Map $profileMap -Key "AUTH_MODE" -Fallback "auto").ToLowerInvariant()
+if ($authModeDefault -notin @("auto", "key", "password")) {
+    $authModeDefault = "auto"
+}
+
+while ($true) {
+    $authMode = (Prompt-WithDefault -Prompt "ssh auth mode (auto/key/password)" -Default $authModeDefault).ToLowerInvariant()
+    if ($authMode -in @("auto", "key", "password")) {
+        break
     }
 
+    Write-Host "please enter auto, key, or password."
+}
+
+$identityFile = ""
+if ($authMode -in @("auto", "key")) {
+    $identityFile = Prompt-WithDefault -Prompt "ssh identity file path (optional)" -Default (Get-ProfileValue -Map $profileMap -Key "IDENTITY_FILE")
+}
+
+$existingPassword = Decode-Base64 (Get-ProfileValue -Map $profileMap -Key "PASSWORD_B64")
+if ([string]::IsNullOrEmpty($existingPassword)) {
+    $existingPassword = Get-ProfileValue -Map $profileMap -Key "PASSWORD"
+}
+
+$password = ""
+if ($authMode -eq "password") {
+    if (-not [string]::IsNullOrEmpty($existingPassword)) {
+        $secure = Read-Host "ssh password (stored in profile) [previous password]" -AsSecureString
+    } else {
+        $secure = Read-Host "ssh password (stored in profile)" -AsSecureString
+    }
+
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try {
+        $password = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    } finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+
+    if ([string]::IsNullOrEmpty($password) -and -not [string]::IsNullOrEmpty($existingPassword)) {
+        $password = $existingPassword
+    }
+}
+
+$syncChoice = (Prompt-WithDefault -Prompt "sync local Codex auth.json before attach? (Y/n)" -Default "Y").ToLowerInvariant()
+$syncAuth = if ($syncChoice -in @("n", "no")) { "0" } else { "1" }
+if ($syncAuth -eq "1") {
+    Write-Host "tip: choose manual if you have already done codex login setup."
     while ($true) {
-        $authMode = (Prompt-WithDefault -Prompt "ssh auth mode (auto/key/password)" -Default $authModeDefault).ToLowerInvariant()
-        if ($authMode -in @("auto", "key", "password")) {
+        $authSetupMode = (Prompt-WithDefault -Prompt "auth setup mode (manual/auto)" -Default "manual").ToLowerInvariant()
+        if ($authSetupMode -in @("manual", "auto")) {
             break
         }
-
-        Write-Host "please enter auto, key, or password."
+        Write-Host "please enter manual or auto."
     }
-
-    $identityFile = ""
-    if ($authMode -in @("auto", "key")) {
-        $identityFile = Prompt-WithDefault -Prompt "ssh identity file path (optional)" -Default (Get-ProfileValue -Map $profileMap -Key "IDENTITY_FILE")
-    }
-
-    $password = ""
-    if ($authMode -eq "password") {
-        $secure = Read-Host "ssh password (stored in profile)" -AsSecureString
-        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-        try {
-            $password = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-        } finally {
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-        }
-    }
-
-    $syncChoice = (Prompt-WithDefault -Prompt "sync local Codex auth.json before attach? (Y/n)" -Default "Y").ToLowerInvariant()
-    $syncAuth = if ($syncChoice -in @("n", "no")) { "0" } else { "1" }
-    if ($syncAuth -eq "1") {
-        while ($true) {
-            $authSetupMode = (Prompt-WithDefault -Prompt "auth setup mode (manual/auto)" -Default "manual").ToLowerInvariant()
-            if ($authSetupMode -in @("manual", "auto")) {
-                break
-            }
-            Write-Host "please enter manual or auto."
-        }
-    }
-
-    $profileValues = @{
-        HOST_ALIAS = $hostAlias
-        HOST_NAME = $hostName
-        USER_NAME = $userName
-        PORT = $port
-        IDENTITY_FILE = $identityFile
-        REMOTE_PROJECT_DIR = $remoteProjectDir
-        SESSION_NAME = $sessionName
-        IDLE_DAYS = $idleDays
-        RECONNECT_DELAY_SECONDS = $reconnectDelay
-        SYNC_AUTH = $syncAuth
-        REMOTE_SCRIPT = (Get-ProfileValue -Map $profileMap -Key "REMOTE_SCRIPT" -Fallback "/usr/local/bin/codex-vps")
-        AUTH_MODE = $authMode
-        PASSWORD = $password
-    }
-
-    Write-ProfileFile -Path $ProfileFile -Values $profileValues
-    Write-Host "saved connection profile: $ProfileFile"
-    Write-Host ""
 }
+
+$profileValues = @{
+    HOST_ALIAS = $hostAlias
+    HOST_NAME = $hostName
+    USER_NAME = $userName
+    PORT = $port
+    IDENTITY_FILE = $identityFile
+    REMOTE_PROJECT_DIR = $remoteProjectDir
+    SESSION_NAME = $sessionName
+    IDLE_DAYS = $idleDays
+    RECONNECT_DELAY_SECONDS = $reconnectDelay
+    SYNC_AUTH = $syncAuth
+    REMOTE_SCRIPT = (Get-ProfileValue -Map $profileMap -Key "REMOTE_SCRIPT" -Fallback "/usr/local/bin/codex-vps")
+    AUTH_MODE = $authMode
+    PASSWORD_B64 = (Encode-Base64 $password)
+}
+
+Write-ProfileFile -Path $ProfileFile -Values $profileValues
+Write-Host "saved connection profile: $ProfileFile"
+Write-Host ""
 
 Write-Rule
 Write-Host "codex auth setup"
