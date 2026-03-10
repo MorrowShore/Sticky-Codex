@@ -165,6 +165,29 @@ function Decode-Base64 {
     }
 }
 
+function Resolve-ProfileFile {
+    if ($PSBoundParameters.ContainsKey("ProfileFile")) {
+        return
+    }
+
+    if (Test-Path $ProfileFile) {
+        return
+    }
+
+    $candidates = @()
+    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        $candidates += (Join-Path $PSScriptRoot "connection.env")
+    }
+    $candidates += (Join-Path (Get-Location).Path "connection.env")
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) {
+            $ProfileFile = $candidate
+            return
+        }
+    }
+}
+
 function Prompt-WithDefault {
     param(
         [string]$Prompt,
@@ -550,6 +573,7 @@ if ($Help) {
     exit 0
 }
 
+Resolve-ProfileFile
 Ensure-OverridesWhenProfileMissing
 Load-ProfileValues
 Ensure-RequiredConnectionValues

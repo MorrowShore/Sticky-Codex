@@ -151,7 +151,10 @@ function Start-CodexLoginWindow {
 }
 
 function Offer-DesktopShortcut {
-    param([string]$ScriptPath)
+    param(
+        [string]$ScriptPath,
+        [string]$ProfilePath
+    )
 
     $choice = (Prompt-WithDefault -Prompt "create desktop shortcut? (y/N)" -Default "N").ToLowerInvariant()
     if ($choice -notin @("y", "yes")) {
@@ -168,7 +171,7 @@ function Offer-DesktopShortcut {
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($shortcutPath)
     $shortcut.TargetPath = "powershell.exe"
-    $shortcut.Arguments = "-ExecutionPolicy Bypass -File `"$ScriptPath`""
+    $shortcut.Arguments = "-NoExit -ExecutionPolicy Bypass -File `"$ScriptPath`" -ProfileFile `"$ProfilePath`""
     $shortcut.WorkingDirectory = (Split-Path -Parent $ScriptPath)
     $shortcut.IconLocation = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe,0"
     $shortcut.Description = "start sticky-codex reconnect launcher"
@@ -401,7 +404,7 @@ if ($syncAuth -eq "1" -and $authSetupMode -eq "auto") {
 Write-Rule
 Write-Host "desktop shortcut"
 Write-Rule
-Offer-DesktopShortcut -ScriptPath $Target
+Offer-DesktopShortcut -ScriptPath $Target -ProfilePath $ProfileFile
 Write-Host ""
 
 Write-Rule

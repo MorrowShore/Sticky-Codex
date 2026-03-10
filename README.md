@@ -26,9 +26,15 @@ installs `codex-vps` to `/usr/local/bin/codex-vps` by default.
 
 ### Windows client
 
-Run from `cmd.exe` or PowerShell:
+If you are in PowerShell, run:
 
 ```powershell
+$u='https://raw.githubusercontent.com/morrowshore/sticky-codex/main/quick-install/windows-client.ps1'; $m='https://raw.githubusercontent.com/morrowshore/sticky-codex/master/quick-install/windows-client.ps1'; try { Invoke-RestMethod $u -UseBasicParsing | Invoke-Expression } catch { Invoke-RestMethod $m -UseBasicParsing | Invoke-Expression }
+```
+
+If you are in `cmd.exe`, run:
+
+```cmd
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$u='https://raw.githubusercontent.com/morrowshore/sticky-codex/main/quick-install/windows-client.ps1'; $m='https://raw.githubusercontent.com/morrowshore/sticky-codex/master/quick-install/windows-client.ps1'; try { Invoke-RestMethod $u -UseBasicParsing | Invoke-Expression } catch { Invoke-RestMethod $m -UseBasicParsing | Invoke-Expression }"
 ```
 

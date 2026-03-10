@@ -268,6 +268,31 @@ ensure_overrides_when_profile_missing() {
   exit 1
 }
 
+resolve_profile_file() {
+  local script_dir script_profile cwd_profile
+
+  if [ "$PROFILE_FILE_SET" = "1" ]; then
+    return
+  fi
+
+  if [ -f "$PROFILE_FILE" ]; then
+    return
+  fi
+
+  script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)"
+  script_profile="$script_dir/connection.env"
+  cwd_profile="$(pwd)/connection.env"
+
+  if [ -f "$script_profile" ]; then
+    PROFILE_FILE="$script_profile"
+    return
+  fi
+
+  if [ -f "$cwd_profile" ]; then
+    PROFILE_FILE="$cwd_profile"
+  fi
+}
+
 ensure_required_connection_values() {
   local missing=()
   if [ -z "$HOST_NAME" ]; then
@@ -376,6 +401,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+resolve_profile_file
 ensure_overrides_when_profile_missing
 load_profile_if_present
 ensure_required_connection_values
