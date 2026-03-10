@@ -10,7 +10,7 @@ design goals:
 
 The project is licensed under the AGPL-3.0 license.
 
-Author: Morrow Shore https://morrowshore.com
+Support: https://morrowshore.com
 
 ## Quick install
 

@@ -270,7 +270,8 @@ function Prompt-ForMissingInputs {
     }
 
     if ([string]::IsNullOrWhiteSpace($UserName)) {
-        $UserName = Prompt-Required -Prompt "remote user" -Default $UserName
+        $defaultUserName = if ([string]::IsNullOrWhiteSpace($UserName)) { "root" } else { $UserName }
+        $UserName = Prompt-Required -Prompt "remote user" -Default $defaultUserName
     }
 
     if ([string]::IsNullOrWhiteSpace($RemoteProjectDir)) {
@@ -294,6 +295,36 @@ function Prompt-ForMissingInputs {
             [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
         }
     }
+}
+
+function Ensure-OverridesWhenProfileMissing {
+    if (Test-Path $ProfileFile) {
+        return
+    }
+
+    $missing = @()
+    if ([string]::IsNullOrWhiteSpace($HostName)) {
+        $missing += "-HostName"
+    }
+    if ([string]::IsNullOrWhiteSpace($UserName)) {
+        $missing += "-UserName"
+    }
+    if ([string]::IsNullOrWhiteSpace($RemoteProjectDir)) {
+        $missing += "-RemoteProjectDir"
+    }
+
+    if ($missing.Count -eq 0) {
+        return
+    }
+
+    Write-Host "connection profile was not found:"
+    Write-Host "  $ProfileFile"
+    Write-Host ""
+    Write-Host "when the profile is missing, pass one-run overrides:"
+    Write-Host "  -HostName your.vps.host -UserName root -RemoteProjectDir /srv/project"
+    Write-Host ""
+    Write-Host "missing required override(s): $($missing -join ', ')"
+    exit 1
 }
 
 function Ensure-WindowsOpenSsh {
@@ -510,6 +541,7 @@ if ($Help) {
     exit 0
 }
 
+Ensure-OverridesWhenProfileMissing
 Load-ProfileValues
 Prompt-ForMissingInputs
 

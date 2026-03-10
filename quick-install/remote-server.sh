@@ -55,10 +55,31 @@ install_launcher() {
   fi
 }
 
-if [ $# -eq 0 ] && [ -t 0 ]; then
-  TARGET="$(prompt_with_default "install path" "$TARGET")"
-fi
+choose_install_target() {
+  local choice
 
+  if [ $# -ne 0 ] || [ ! -t 0 ]; then
+    return
+  fi
+
+  while true; do
+    choice="$(prompt_with_default "install location (default/here)" "default")"
+    case "$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]')" in
+      default)
+        return
+        ;;
+      here)
+        TARGET="$(pwd)/codex-vps"
+        return
+        ;;
+      *)
+        echo "please enter default or here." >&2
+        ;;
+    esac
+  done
+}
+
+choose_install_target "$@"
 download_launcher
 install_launcher
 printf 'installed %s\n' "$TARGET"

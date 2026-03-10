@@ -216,7 +216,7 @@ prompt_for_missing_inputs() {
     HOST_NAME="$(prompt_required "remote host (ip or domain)" "$HOST_NAME")"
   fi
   if [ -z "$USER_NAME" ]; then
-    USER_NAME="$(prompt_required "remote user" "$USER_NAME")"
+    USER_NAME="$(prompt_required "remote user" "${USER_NAME:-root}")"
   fi
   if [ -z "$REMOTE_PROJECT_DIR" ]; then
     REMOTE_PROJECT_DIR="$(prompt_required "remote project directory" "$REMOTE_PROJECT_DIR")"
@@ -235,6 +235,36 @@ prompt_for_missing_inputs() {
     read -r -s -p "ssh password: " PASSWORD
     printf '\n'
   fi
+}
+
+ensure_overrides_when_profile_missing() {
+  if [ -f "$PROFILE_FILE" ]; then
+    return
+  fi
+
+  local missing=()
+  if [ -z "$HOST_NAME" ]; then
+    missing+=("--host-name")
+  fi
+  if [ -z "$USER_NAME" ]; then
+    missing+=("--user-name")
+  fi
+  if [ -z "$REMOTE_PROJECT_DIR" ]; then
+    missing+=("--remote-project-dir")
+  fi
+
+  if [ "${#missing[@]}" -eq 0 ]; then
+    return
+  fi
+
+  echo "connection profile was not found:" >&2
+  echo "  $PROFILE_FILE" >&2
+  echo >&2
+  echo "when the profile is missing, pass one-run overrides:" >&2
+  echo "  --host-name your.vps.host --user-name root --remote-project-dir /srv/project" >&2
+  echo >&2
+  echo "missing required override(s): ${missing[*]}" >&2
+  exit 1
 }
 
 while [ $# -gt 0 ]; do
@@ -321,6 +351,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+ensure_overrides_when_profile_missing
 load_profile_if_present
 prompt_for_missing_inputs
 

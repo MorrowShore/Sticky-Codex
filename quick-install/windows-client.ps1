@@ -8,6 +8,7 @@ $repoOwner = "morrowshore"
 $repoName = "sticky-codex"
 $branches = @("main", "master")
 $targetDir = Split-Path -Parent $Target
+$targetWasExplicit = $PSBoundParameters.ContainsKey("Target")
 
 function Read-ProfileMap {
     param([string]$Path)
@@ -90,6 +91,67 @@ function Prompt-Required {
     }
 }
 
+function Write-Rule {
+    Write-Host "------------------------------------------------------------"
+}
+
+function Ensure-CodexConfigFileStoreLine {
+    param([string]$ConfigPath)
+
+    $configDir = Split-Path -Parent $ConfigPath
+    if (-not (Test-Path $configDir)) {
+        $null = New-Item -ItemType Directory -Force -Path $configDir
+    }
+
+    $line = 'cli_auth_credentials_store = "file"'
+    $existing = @()
+
+    if (Test-Path $ConfigPath) {
+        $existing = Get-Content -Path $ConfigPath
+    }
+
+    $filtered = @($existing | Where-Object { $_.Trim() -ne $line })
+    $newContent = @($line) + $filtered
+    $text = ($newContent -join "`r`n")
+    if (-not [string]::IsNullOrEmpty($text)) {
+        $text += "`r`n"
+    }
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($ConfigPath, $text, $utf8NoBom)
+}
+
+function Start-CodexLoginWindow {
+    Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoExit", "-Command", "codex login") | Out-Null
+}
+
+function Offer-DesktopShortcut {
+    param([string]$ScriptPath)
+
+    $choice = (Prompt-WithDefault -Prompt "create desktop shortcut? (y/N)" -Default "N").ToLowerInvariant()
+    if ($choice -notin @("y", "yes")) {
+        return
+    }
+
+    $desktopPath = [Environment]::GetFolderPath("Desktop")
+    if ([string]::IsNullOrWhiteSpace($desktopPath) -or -not (Test-Path $desktopPath)) {
+        Write-Host "desktop path was not found. skipped shortcut creation."
+        return
+    }
+
+    $shortcutPath = Join-Path $desktopPath "sticky-codex.lnk"
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = "powershell.exe"
+    $shortcut.Arguments = "-ExecutionPolicy Bypass -File `"$ScriptPath`""
+    $shortcut.WorkingDirectory = (Split-Path -Parent $ScriptPath)
+    $shortcut.IconLocation = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe,0"
+    $shortcut.Description = "start sticky-codex reconnect launcher"
+    $shortcut.Save()
+
+    Write-Host "desktop shortcut created: $shortcutPath"
+}
+
 function Download-Launcher {
     param([string]$OutFile)
 
@@ -103,6 +165,28 @@ function Download-Launcher {
     }
 
     throw "failed to download windows-client/codex-remote.ps1 from main or master branch."
+}
+
+function Resolve-InstallTarget {
+    if ($script:targetWasExplicit) {
+        return
+    }
+
+    while ($true) {
+        $choice = (Prompt-WithDefault -Prompt "install location (default/here)" -Default "default").ToLowerInvariant()
+        switch ($choice) {
+            "default" {
+                return
+            }
+            "here" {
+                $Target = Join-Path (Get-Location).Path "codex-remote.ps1"
+                return
+            }
+            default {
+                Write-Host "please enter default or here."
+            }
+        }
+    }
 }
 
 function Write-ProfileFile {
@@ -146,6 +230,8 @@ function Write-ProfileFile {
     Set-Content -Path $Path -Value ($lines -join "`r`n")
 }
 
+Resolve-InstallTarget
+$targetDir = Split-Path -Parent $Target
 if (-not (Test-Path $targetDir)) {
     $null = New-Item -ItemType Directory -Force -Path $targetDir
 }
@@ -156,11 +242,16 @@ Write-Host "downloaded $Target"
 Write-Host ""
 
 $profileMap = Read-ProfileMap -Path $ProfileFile
+$syncAuth = Get-ProfileValue -Map $profileMap -Key "SYNC_AUTH" -Fallback "1"
+$authSetupMode = "manual"
 $shouldSetup = (Prompt-WithDefault -Prompt "configure remote connection profile now? (Y/n)" -Default "Y").ToLowerInvariant()
 if ($shouldSetup -notin @("n", "no")) {
+    Write-Rule
+    Write-Host "remote connection setup"
+    Write-Rule
     $hostAlias = Prompt-WithDefault -Prompt "host alias" -Default (Get-ProfileValue -Map $profileMap -Key "HOST_ALIAS" -Fallback "myvps")
     $hostName = Prompt-Required -Prompt "remote host (ip or domain)" -Default (Get-ProfileValue -Map $profileMap -Key "HOST_NAME")
-    $userName = Prompt-Required -Prompt "remote user" -Default (Get-ProfileValue -Map $profileMap -Key "USER_NAME")
+    $userName = Prompt-Required -Prompt "remote user" -Default (Get-ProfileValue -Map $profileMap -Key "USER_NAME" -Fallback "root")
     $port = Prompt-WithDefault -Prompt "ssh port" -Default (Get-ProfileValue -Map $profileMap -Key "PORT" -Fallback "22")
     $remoteProjectDir = Prompt-Required -Prompt "remote project directory" -Default (Get-ProfileValue -Map $profileMap -Key "REMOTE_PROJECT_DIR")
     $sessionName = Prompt-WithDefault -Prompt "session name (blank for auto)" -Default (Get-ProfileValue -Map $profileMap -Key "SESSION_NAME")
@@ -199,6 +290,15 @@ if ($shouldSetup -notin @("n", "no")) {
 
     $syncChoice = (Prompt-WithDefault -Prompt "sync local Codex auth.json before attach? (Y/n)" -Default "Y").ToLowerInvariant()
     $syncAuth = if ($syncChoice -in @("n", "no")) { "0" } else { "1" }
+    if ($syncAuth -eq "1") {
+        while ($true) {
+            $authSetupMode = (Prompt-WithDefault -Prompt "auth setup mode (manual/auto)" -Default "manual").ToLowerInvariant()
+            if ($authSetupMode -in @("manual", "auto")) {
+                break
+            }
+            Write-Host "please enter manual or auto."
+        }
+    }
 
     $profileValues = @{
         HOST_ALIAS = $hostAlias
@@ -221,22 +321,66 @@ if ($shouldSetup -notin @("n", "no")) {
     Write-Host ""
 }
 
-Write-Host "put this in %USERPROFILE%\.codex\config.toml:"
+Write-Rule
+Write-Host "codex auth setup"
+Write-Rule
+$codexConfigPath = Join-Path $HOME ".codex\config.toml"
+if ($syncAuth -eq "1" -and $authSetupMode -eq "auto") {
+    Ensure-CodexConfigFileStoreLine -ConfigPath $codexConfigPath
+    Start-CodexLoginWindow
+    Write-Host "auto mode applied:"
+    Write-Host "  - added cli_auth_credentials_store = ""file"" at the top of:"
+    Write-Host "    $codexConfigPath"
+    Write-Host "  - started codex login in a new PowerShell window"
+    Write-Host ""
+    Write-Host "setup is finished in this installer window."
+    Write-Host "open the config file anytime with:"
+    Write-Host "  notepad `"$codexConfigPath`""
+    Write-Host ""
+} elseif ($syncAuth -eq "1") {
+    Write-Host "manual mode selected."
+    Write-Host "put this in %USERPROFILE%\.codex\config.toml:"
+    Write-Host ""
+    Write-Host '```toml'
+    Write-Host 'cli_auth_credentials_store = "file"'
+    Write-Host '```'
+    Write-Host ""
+    Write-Host "then run:"
+    Write-Host ""
+    Write-Host "  codex login"
+    Write-Host ""
+    Write-Host "open the config file with:"
+    Write-Host "  notepad `"$codexConfigPath`""
+    Write-Host ""
+    Write-Host "why: sticky-codex syncs auth.json to the remote server before attach, and Codex only writes auth.json when file-based auth storage is enabled."
+    Write-Host ""
+} else {
+    Write-Host "sync of local auth.json is disabled in this profile."
+    Write-Host "you can still run codex login later if needed."
+    Write-Host ""
+}
+
+Write-Rule
+Write-Host "desktop shortcut"
+Write-Rule
+Offer-DesktopShortcut -ScriptPath $Target
 Write-Host ""
-Write-Host '```toml'
-Write-Host 'cli_auth_credentials_store = "file"'
-Write-Host '```'
-Write-Host ""
-Write-Host "then run:"
-Write-Host ""
-Write-Host "  codex login"
-Write-Host ""
-Write-Host "why: sticky-codex syncs auth.json to the remote server before attach, and Codex only writes auth.json when file-based auth storage is enabled."
-Write-Host ""
-Write-Host "start it with:"
+
+Write-Rule
+Write-Host "how to run after setup"
+Write-Rule
+Write-Host "option 1 (direct command):"
 Write-Host ""
 Write-Host "  powershell -ExecutionPolicy Bypass -File `"$Target`""
 Write-Host ""
-Write-Host "override settings for one run if needed (flags win over profile):"
+Write-Host "option 2 (from install directory):"
 Write-Host ""
-Write-Host "  powershell -ExecutionPolicy Bypass -File `"$Target`" -HostName `"your.vps.host`" -UserName `"youruser`" -RemoteProjectDir `"/srv/project`""
+Write-Host "  cd `"$targetDir`""
+Write-Host "  powershell -ExecutionPolicy Bypass -File `".\codex-remote.ps1`""
+Write-Host ""
+Write-Host "one-run override command (flags win over profile):"
+Write-Host ""
+Write-Host "  powershell -ExecutionPolicy Bypass -File `"$Target`" -HostName `"your.vps.host`" -UserName `"root`" -RemoteProjectDir `"/srv/project`""
+Write-Host ""
+Write-Host "note: if $ProfileFile is missing later, overrides are required (-HostName, -UserName, -RemoteProjectDir)."
+Write-Rule

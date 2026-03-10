@@ -7,6 +7,7 @@ REPO_OWNER="morrowshore"
 REPO_NAME="sticky-codex"
 TMP_FILE="$(mktemp)"
 trap 'rm -f "$TMP_FILE"' EXIT
+RULE='------------------------------------------------------------'
 
 download_launcher() {
   local rel_path="linux-client/codex-remote.sh"
@@ -107,6 +108,30 @@ prompt_required() {
   done
 }
 
+choose_install_target() {
+  local choice
+
+  if [ $# -ne 0 ] || [ ! -t 0 ]; then
+    return
+  fi
+
+  while true; do
+    choice="$(prompt_with_default "install location (default/here)" "default")"
+    case "$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]')" in
+      default)
+        return
+        ;;
+      here)
+        TARGET="$(pwd)/codex-remote"
+        return
+        ;;
+      *)
+        echo "please enter default or here." >&2
+        ;;
+    esac
+  done
+}
+
 normalize_auth_mode() {
   local mode
   mode="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
@@ -159,9 +184,12 @@ collect_profile_inputs() {
       ;;
   esac
 
+  printf '%s\n' "$RULE"
+  printf 'remote connection setup\n'
+  printf '%s\n' "$RULE"
   HOST_ALIAS="$(prompt_with_default "host alias" "$HOST_ALIAS")"
   HOST_NAME="$(prompt_required "remote host (ip or domain)" "$HOST_NAME")"
-  USER_NAME="$(prompt_required "remote user" "$USER_NAME")"
+  USER_NAME="$(prompt_required "remote user" "${USER_NAME:-root}")"
   PORT="$(prompt_with_default "ssh port" "$PORT")"
   REMOTE_PROJECT_DIR="$(prompt_required "remote project directory" "$REMOTE_PROJECT_DIR")"
   SESSION_NAME="$(prompt_with_default "session name (blank for auto)" "$SESSION_NAME")"
@@ -222,6 +250,7 @@ load_defaults_from_existing_profile() {
   [ -n "$AUTH_MODE" ] || AUTH_MODE="auto"
 }
 
+choose_install_target "$@"
 download_launcher
 install_launcher
 printf 'installed %s\n' "$TARGET"
@@ -234,6 +263,9 @@ else
 fi
 
 printf '\n'
+printf '%s\n' "$RULE"
+printf 'codex auth setup\n'
+printf '%s\n' "$RULE"
 printf 'put this in ~/.codex/config.toml:\n\n'
 printf '```toml\n'
 printf 'cli_auth_credentials_store = "file"\n'
@@ -242,7 +274,15 @@ printf 'then run:\n\n'
 printf '  codex login\n\n'
 printf 'why: sticky-codex syncs auth.json to the remote server before attach, and Codex only writes auth.json when file-based auth storage is enabled.\n'
 printf '\n'
-printf 'start it with:\n\n'
+printf '%s\n' "$RULE"
+printf 'how to run after setup\n'
+printf '%s\n' "$RULE"
+printf 'option 1 (direct command):\n\n'
 printf '  %s\n\n' "$TARGET"
-printf 'override settings for one run if needed (flags win over profile):\n\n'
-printf '  %s --host-name your.vps.host --user-name youruser --remote-project-dir /srv/project\n' "$TARGET"
+printf 'option 2 (from install directory):\n\n'
+printf '  cd %s\n' "$(dirname "$TARGET")"
+printf '  ./%s\n\n' "$(basename "$TARGET")"
+printf 'one-run override command (flags win over profile):\n\n'
+printf '  %s --host-name your.vps.host --user-name root --remote-project-dir /srv/project\n\n' "$TARGET"
+printf 'note: if %s is missing later, overrides are required (--host-name, --user-name, --remote-project-dir).\n' "$PROFILE_FILE"
+printf '%s\n' "$RULE"
