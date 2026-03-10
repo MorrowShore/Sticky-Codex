@@ -753,6 +753,44 @@ ensure_sshpass_if_configured() {
   fi
 }
 
+ensure_ncat_if_proxy_configured() {
+  if [ "$PROXY_TYPE" = "no" ] || [ -z "$PROXY_SPEC" ]; then
+    return
+  fi
+
+  if has_command ncat; then
+    return
+  fi
+
+  echo "proxy mode requires ncat. attempting to install ncat..."
+  if ! has_command sudo; then
+    echo "sudo is required to install ncat automatically." >&2
+    exit 1
+  fi
+
+  if has_command apt-get; then
+    sudo apt-get update || true
+    sudo apt-get install -y ncat || sudo apt-get install -y nmap-ncat || true
+  elif has_command dnf; then
+    sudo dnf install -y nmap-ncat || sudo dnf install -y ncat || true
+  elif has_command yum; then
+    sudo yum install -y nmap-ncat || sudo yum install -y ncat || true
+  elif has_command pacman; then
+    sudo pacman -Sy --noconfirm nmap || true
+  elif has_command zypper; then
+    sudo zypper --non-interactive install ncat || sudo zypper --non-interactive install nmap || true
+  elif has_command apk; then
+    sudo apk add nmap-ncat || sudo apk add nmap || true
+  else
+    echo "could not find a supported package manager for ncat." >&2
+  fi
+
+  if ! has_command ncat; then
+    echo "proxy mode requires ncat in PATH." >&2
+    exit 1
+  fi
+}
+
 ensure_codex() {
   if has_command codex; then
     return
@@ -823,7 +861,7 @@ write_temp_ssh_config() {
     printf '    HostName %s\n' "$HOST_NAME"
     printf '    User %s\n' "$USER_NAME"
     printf '    Port %s\n' "$PORT"
-    printf '    ServerAliveInterval 30\n'
+    printf '    ServerAliveInterval 15\n'
     printf '    ServerAliveCountMax 120\n'
     printf '    TCPKeepAlive yes\n'
     printf '    RequestTTY force\n'
@@ -957,6 +995,7 @@ AUTH_MODE="$(normalize_auth_mode "$AUTH_MODE")"
 show_banner
 ensure_ssh_tools
 ensure_sshpass_if_configured
+ensure_ncat_if_proxy_configured
 ensure_codex
 
 SSH_CONFIG_PATH="$(mktemp)"

@@ -42,6 +42,7 @@ $ErrorActionPreference = "Stop"
 $script:SshBackend = "openssh"
 $script:PlinkExe = "plink"
 $script:PscpExe = "pscp"
+$script:NcatExe = "ncat"
 
 function Show-Banner {
     Write-Host "sticky-codex"
@@ -231,24 +232,24 @@ function Parse-ProxySpec {
         throw "invalid proxy spec. expected host:port or host:port:username:password"
     }
 
-    $host = $parts[0].Trim()
-    $port = $parts[1].Trim()
-    if ([string]::IsNullOrWhiteSpace($host) -or [string]::IsNullOrWhiteSpace($port)) {
+    $proxyHost = $parts[0].Trim()
+    $proxyPort = $parts[1].Trim()
+    if ([string]::IsNullOrWhiteSpace($proxyHost) -or [string]::IsNullOrWhiteSpace($proxyPort)) {
         throw "invalid proxy spec. host and port are required."
     }
 
-    $username = ""
-    $password = ""
+    $proxyUser = ""
+    $proxyPassword = ""
     if ($parts.Count -eq 4) {
-        $username = $parts[2]
-        $password = $parts[3]
+        $proxyUser = $parts[2]
+        $proxyPassword = $parts[3]
     }
 
     return @{
-        Host = $host
-        Port = $port
-        Username = $username
-        Password = $password
+        Host = $proxyHost
+        Port = $proxyPort
+        Username = $proxyUser
+        Password = $proxyPassword
     }
 }
 
@@ -262,20 +263,85 @@ function Build-NcatProxyCommand {
         return ""
     }
 
-    $ncat = Get-Command ncat -ErrorAction SilentlyContinue
-    if (-not $ncat) {
+    if (-not (Resolve-NcatExe)) {
         throw "proxy mode requires ncat in PATH."
     }
 
     $proxy = Parse-ProxySpec -Spec $script:ProxySpec
     $type = if ($script:ProxyType -eq "socks5") { "socks5" } else { "http" }
-    $cmd = "ncat --proxy $($proxy.Host):$($proxy.Port) --proxy-type $type"
+    $ncatCmd = $script:NcatExe
+    if ($ncatCmd -match "\s") {
+        $ncatCmd = '"' + ($ncatCmd -replace '"', '\"') + '"'
+    }
+
+    $cmd = "$ncatCmd --proxy $($proxy.Host):$($proxy.Port) --proxy-type $type"
     if (-not [string]::IsNullOrWhiteSpace($proxy.Username)) {
         $cmd += " --proxy-auth $($proxy.Username):$($proxy.Password)"
     }
     $cmd += " $TargetHostToken $TargetPortToken"
 
     return $cmd
+}
+
+function Resolve-NcatExe {
+    $ncat = Get-Command ncat -ErrorAction SilentlyContinue
+    if ($ncat) {
+        $script:NcatExe = $ncat.Source
+        return $true
+    }
+
+    foreach ($candidate in @("$env:ProgramFiles\Nmap\ncat.exe", "$env:ProgramFiles(x86)\Nmap\ncat.exe")) {
+        if (Test-Path $candidate) {
+            $script:NcatExe = $candidate
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Ensure-NcatForOpenSshProxy {
+    if ($script:SshBackend -ne "openssh") {
+        return
+    }
+
+    if ($script:ProxyType -eq "no" -or [string]::IsNullOrWhiteSpace($script:ProxySpec)) {
+        return
+    }
+
+    if (Resolve-NcatExe) {
+        return
+    }
+
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if ($winget) {
+        Write-Host "proxy mode with OpenSSH requires ncat. attempting install via winget (Nmap)..."
+        try {
+            & winget install --id Nmap.Nmap -e --accept-package-agreements --accept-source-agreements --silent | Out-Null
+        } catch {
+        }
+    }
+
+    if (-not (Resolve-NcatExe)) {
+        throw "proxy mode with OpenSSH requires ncat. install Nmap (ncat), or use password auth (PuTTY backend)."
+    }
+}
+
+function Get-PuttyProxyArgs {
+    if ($script:ProxyType -eq "no" -or [string]::IsNullOrWhiteSpace($script:ProxySpec)) {
+        return @()
+    }
+
+    $proxy = Parse-ProxySpec -Spec $script:ProxySpec
+    $puttyType = if ($script:ProxyType -eq "socks5") { "5" } else { "http" }
+    $args = @("-proxytype", $puttyType, "-proxyhost", $proxy.Host, "-proxyport", $proxy.Port)
+
+    if (-not [string]::IsNullOrWhiteSpace($proxy.Username)) {
+        $args += @("-proxyuser", $proxy.Username)
+        $args += @("-proxypass", $proxy.Password)
+    }
+
+    return $args
 }
 
 function Resolve-PuttyToolsFromKnownLocations {
@@ -746,9 +812,7 @@ function Invoke-RemoteSsh {
             $args += @("-pw", $Password)
         }
 
-        if ($script:ProxyType -ne "no" -and -not [string]::IsNullOrWhiteSpace($script:ProxySpec)) {
-            $args += @("-proxycmd", (Build-NcatProxyCommand -TargetHostToken "%host" -TargetPortToken "%port"))
-        }
+        $args += Get-PuttyProxyArgs
 
         if ($Interactive) {
             $args += @("-t", $HostName, $RemoteCommand)
@@ -787,9 +851,7 @@ function Invoke-RemoteScp {
             $args += @("-pw", $Password)
         }
 
-        if ($script:ProxyType -ne "no" -and -not [string]::IsNullOrWhiteSpace($script:ProxySpec)) {
-            $args += @("-proxycmd", (Build-NcatProxyCommand -TargetHostToken "%host" -TargetPortToken "%port"))
-        }
+        $args += Get-PuttyProxyArgs
 
         $args += @($LocalPath, "$HostName`:$RemotePath")
         & $script:PscpExe @args
@@ -839,7 +901,7 @@ function Write-TempSshConfig {
     $lines += "    HostName $HostName"
     $lines += "    User $UserName"
     $lines += "    Port $Port"
-    $lines += "    ServerAliveInterval 30"
+    $lines += "    ServerAliveInterval 15"
     $lines += "    ServerAliveCountMax 120"
     $lines += "    TCPKeepAlive yes"
     $lines += "    RequestTTY force"
@@ -865,7 +927,7 @@ function Write-TempSshConfig {
         }
     }
 
-    if ($script:ProxyType -ne "no" -and -not [string]::IsNullOrWhiteSpace($script:ProxySpec)) {
+    if ($script:SshBackend -eq "openssh" -and $script:ProxyType -ne "no" -and -not [string]::IsNullOrWhiteSpace($script:ProxySpec)) {
         $lines += "    ProxyCommand $(Build-NcatProxyCommand -TargetHostToken '%h' -TargetPortToken '%p')"
     }
 
@@ -977,8 +1039,9 @@ $script:SshConfigPath = Join-Path $TempDir "ssh_config"
 Show-Banner
 Ensure-WindowsOpenSsh
 Ensure-Codex
-Write-TempSshConfig
 Select-SshBackend
+Ensure-NcatForOpenSshProxy
+Write-TempSshConfig
 Test-RemotePrereqs
 
 if (-not $NoSyncAuth) {

@@ -1,12 +1,13 @@
-# sticky-codex
+# Sticky Codex
 
-sticky-codex keeps a Codex CLI session alive on a remote Linux server through `tmux`, while local launchers handle reconnect loops for Windows and Linux.
+Sticky Codex keeps a Codex CLI session alive on a remote Linux server through `tmux`, while local launchers handle reconnect loops for Windows and Linux, all to prevent interruption during even the worst internet instabilities.
 
 design goals:
 - reconnect quickly after SSH disconnects
-- reuse the same remote Codex session instead of starting over
-- keep auth sync practical (`auth.json` sync before attach)
-- clean up stale sessions automatically after idle timeout
+- recover the same terminal and remote Codex session instead of starting over
+- clean up stale sessions automatically after long idle periods
+- practical, easy to use, small
+
 
 The project is licensed under the AGPL-3.0 license.
 
@@ -144,3 +145,9 @@ password-mode reconnect behavior:
 proxy mode:
 - both client launchers can prompt for `no|socks5|http`
 - proxy format is `host:port` or `host:port:username:password`
+- Windows: `ncat` is only needed when using OpenSSH proxy mode; launcher auto-attempts `winget install Nmap.Nmap`.
+- Linux: launcher auto-attempts package-manager install for `ncat` when proxy is enabled.
+
+connection resilience:
+- keepalive is enabled (`ServerAliveInterval 15`, `ServerAliveCountMax 120`, `TCPKeepAlive yes`) to reduce idle/NAT drops.
+- brief internet outages cannot be fully prevented at TCP level, so launcher reconnect logic is the hard guarantee.
