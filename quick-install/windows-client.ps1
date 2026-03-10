@@ -180,15 +180,40 @@ function Offer-DesktopShortcut {
     Write-Host "desktop shortcut created: $shortcutPath"
 }
 
+function Invoke-WebRequestWithRetry {
+    param(
+        [string]$Uri,
+        [string]$OutFile,
+        [int]$Attempts = 6,
+        [int]$BaseDelaySeconds = 4
+    )
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $OutFile -TimeoutSec 180
+            if (Test-Path $OutFile) {
+                return $true
+            }
+        } catch {
+        }
+
+        if ($attempt -lt $Attempts) {
+            $delay = [Math]::Min(30, $BaseDelaySeconds * $attempt)
+            Write-Host "download failed (attempt $attempt/$Attempts). retrying in $delay seconds..."
+            Start-Sleep -Seconds $delay
+        }
+    }
+
+    return $false
+}
+
 function Download-Launcher {
     param([string]$OutFile)
 
     foreach ($branch in $branches) {
         $uri = "https://raw.githubusercontent.com/$repoOwner/$repoName/$branch/windows-client/codex-remote.ps1"
-        try {
-            Invoke-WebRequest -UseBasicParsing -Uri $uri -OutFile $OutFile
+        if (Invoke-WebRequestWithRetry -Uri $uri -OutFile $OutFile) {
             return
-        } catch {
         }
     }
 

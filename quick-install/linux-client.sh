@@ -9,15 +9,39 @@ TMP_FILE="$(mktemp)"
 trap 'rm -f "$TMP_FILE"' EXIT
 RULE='------------------------------------------------------------'
 
+download_with_retry() {
+  local url="$1"
+  local out_file="$2"
+  local attempts=6
+  local attempt delay
+
+  for attempt in $(seq 1 "$attempts"); do
+    if curl -fL --connect-timeout 20 --max-time 300 "$url" -o "$out_file"; then
+      return 0
+    fi
+
+    if [ "$attempt" -lt "$attempts" ]; then
+      delay=$(( attempt * 4 ))
+      if [ "$delay" -gt 30 ]; then
+        delay=30
+      fi
+      echo "download failed (attempt $attempt/$attempts). retrying in $delay seconds..." >&2
+      sleep "$delay"
+    fi
+  done
+
+  return 1
+}
+
 download_launcher() {
   local rel_path="linux-client/codex-remote.sh"
   local base="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME"
 
-  if curl -fsSL "$base/main/$rel_path" -o "$TMP_FILE"; then
+  if download_with_retry "$base/main/$rel_path" "$TMP_FILE"; then
     return
   fi
 
-  if curl -fsSL "$base/master/$rel_path" -o "$TMP_FILE"; then
+  if download_with_retry "$base/master/$rel_path" "$TMP_FILE"; then
     return
   fi
 

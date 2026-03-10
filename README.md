@@ -17,6 +17,10 @@ Support: https://morrowshore.com
 
 These scripts download the launchers and then prompt for remote destination/auth values, proxy settings, and install location (`default`/`here`). Client installers write a reusable connection profile so later runs can start with no flags.
 
+download resilience:
+- quick-install scripts use higher network timeouts plus retry/backoff before failing.
+- runtime dependency fetches (PuTTY/Nmap on Windows) also retry before fatal errors.
+
 ### remote Linux server
 
 ```bash

@@ -183,6 +183,33 @@ function Encode-Base64 {
     return [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text))
 }
 
+function Invoke-WithRetry {
+    param(
+        [string]$Label,
+        [scriptblock]$Action,
+        [int]$Attempts = 5,
+        [int]$BaseDelaySeconds = 4
+    )
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            & $Action
+            return $true
+        } catch {
+            if ($attempt -ge $Attempts) {
+                Write-Host "$Label failed after $Attempts attempts."
+                return $false
+            }
+
+            $delay = [Math]::Min(30, $BaseDelaySeconds * $attempt)
+            Write-Host "$Label failed (attempt $attempt/$Attempts). retrying in $delay seconds..."
+            Start-Sleep -Seconds $delay
+        }
+    }
+
+    return $false
+}
+
 function Escape-ProfileValue {
     param([string]$Value)
 
@@ -312,9 +339,11 @@ function Ensure-NcatForProxy {
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if ($winget) {
         Write-Host "proxy mode requires ncat. attempting install via winget (Nmap)..."
-        try {
+        $null = Invoke-WithRetry -Label "winget install Nmap.Nmap" -Attempts 4 -BaseDelaySeconds 10 -Action {
             & winget install --id Nmap.Nmap -e --accept-package-agreements --accept-source-agreements --silent | Out-Null
-        } catch {
+            if ($LASTEXITCODE -ne 0) {
+                throw "winget exited with code $LASTEXITCODE"
+            }
         }
     }
 
@@ -391,10 +420,23 @@ function Download-PuttyPortableTools {
         $plinkPath = Join-Path $toolDir "plink.exe"
         $pscpPath = Join-Path $toolDir "pscp.exe"
 
-        try {
-            Invoke-WebRequest -Uri $variant.Plink -OutFile $plinkPath
-            Invoke-WebRequest -Uri $variant.Pscp -OutFile $pscpPath
-        } catch {
+        $plinkOk = Invoke-WithRetry -Label "download plink.exe" -Attempts 6 -BaseDelaySeconds 5 -Action {
+            Invoke-WebRequest -Uri $variant.Plink -OutFile $plinkPath -TimeoutSec 180
+            if (-not (Test-Path $plinkPath)) {
+                throw "plink download did not produce a file."
+            }
+        }
+        if (-not $plinkOk) {
+            continue
+        }
+
+        $pscpOk = Invoke-WithRetry -Label "download pscp.exe" -Attempts 6 -BaseDelaySeconds 5 -Action {
+            Invoke-WebRequest -Uri $variant.Pscp -OutFile $pscpPath -TimeoutSec 180
+            if (-not (Test-Path $pscpPath)) {
+                throw "pscp download did not produce a file."
+            }
+        }
+        if (-not $pscpOk) {
             continue
         }
 
@@ -414,9 +456,11 @@ function Ensure-PuttyTools {
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if ($winget) {
         Write-Host "plink/pscp not found. attempting to install PuTTY with winget..."
-        try {
+        $null = Invoke-WithRetry -Label "winget install PuTTY.PuTTY" -Attempts 4 -BaseDelaySeconds 8 -Action {
             & winget install --id PuTTY.PuTTY -e --accept-package-agreements --accept-source-agreements --silent | Out-Null
-        } catch {
+            if ($LASTEXITCODE -ne 0) {
+                throw "winget exited with code $LASTEXITCODE"
+            }
         }
 
         if (Resolve-PuttyToolsFromKnownLocations) {
