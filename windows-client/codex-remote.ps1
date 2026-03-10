@@ -170,7 +170,7 @@ function Resolve-ProfileFile {
         return
     }
 
-    if (Test-Path $ProfileFile) {
+    if (Test-Path $script:ProfileFile) {
         return
     }
 
@@ -182,7 +182,7 @@ function Resolve-ProfileFile {
 
     foreach ($candidate in $candidates) {
         if (Test-Path $candidate) {
-            $ProfileFile = $candidate
+            $script:ProfileFile = $candidate
             return
         }
     }
@@ -223,47 +223,47 @@ function Prompt-Required {
 }
 
 function Load-ProfileValues {
-    $profileMap = Read-ProfileMap -Path $ProfileFile
+    $profileMap = Read-ProfileMap -Path $script:ProfileFile
 
-    if ([string]::IsNullOrWhiteSpace($HostAlias)) {
-        $HostAlias = Get-ProfileValue -Map $profileMap -Key "HOST_ALIAS" -Fallback "myvps"
+    if ([string]::IsNullOrWhiteSpace($script:HostAlias)) {
+        $script:HostAlias = Get-ProfileValue -Map $profileMap -Key "HOST_ALIAS" -Fallback "myvps"
     }
 
-    if ([string]::IsNullOrWhiteSpace($HostName)) {
-        $HostName = Get-ProfileValue -Map $profileMap -Key "HOST_NAME"
+    if ([string]::IsNullOrWhiteSpace($script:HostName)) {
+        $script:HostName = Get-ProfileValue -Map $profileMap -Key "HOST_NAME"
     }
 
-    if ([string]::IsNullOrWhiteSpace($UserName)) {
-        $UserName = Get-ProfileValue -Map $profileMap -Key "USER_NAME"
+    if ([string]::IsNullOrWhiteSpace($script:UserName)) {
+        $script:UserName = Get-ProfileValue -Map $profileMap -Key "USER_NAME"
     }
 
     if (-not $PSBoundParameters.ContainsKey("Port")) {
         $profilePort = Get-ProfileValue -Map $profileMap -Key "PORT"
         if (-not [string]::IsNullOrWhiteSpace($profilePort)) {
             try {
-                $Port = [int]$profilePort
+                $script:Port = [int]$profilePort
             } catch {
             }
         }
     }
 
-    if ([string]::IsNullOrWhiteSpace($IdentityFile)) {
-        $IdentityFile = Get-ProfileValue -Map $profileMap -Key "IDENTITY_FILE"
+    if ([string]::IsNullOrWhiteSpace($script:IdentityFile)) {
+        $script:IdentityFile = Get-ProfileValue -Map $profileMap -Key "IDENTITY_FILE"
     }
 
-    if ([string]::IsNullOrWhiteSpace($RemoteProjectDir)) {
-        $RemoteProjectDir = Get-ProfileValue -Map $profileMap -Key "REMOTE_PROJECT_DIR"
+    if ([string]::IsNullOrWhiteSpace($script:RemoteProjectDir)) {
+        $script:RemoteProjectDir = Get-ProfileValue -Map $profileMap -Key "REMOTE_PROJECT_DIR"
     }
 
-    if ([string]::IsNullOrWhiteSpace($SessionName)) {
-        $SessionName = Get-ProfileValue -Map $profileMap -Key "SESSION_NAME"
+    if ([string]::IsNullOrWhiteSpace($script:SessionName)) {
+        $script:SessionName = Get-ProfileValue -Map $profileMap -Key "SESSION_NAME"
     }
 
     if (-not $PSBoundParameters.ContainsKey("IdleDays")) {
         $profileIdle = Get-ProfileValue -Map $profileMap -Key "IDLE_DAYS"
         if (-not [string]::IsNullOrWhiteSpace($profileIdle)) {
             try {
-                $IdleDays = [int]$profileIdle
+                $script:IdleDays = [int]$profileIdle
             } catch {
             }
         }
@@ -273,7 +273,7 @@ function Load-ProfileValues {
         $profileDelay = Get-ProfileValue -Map $profileMap -Key "RECONNECT_DELAY_SECONDS"
         if (-not [string]::IsNullOrWhiteSpace($profileDelay)) {
             try {
-                $ReconnectDelaySeconds = [int]$profileDelay
+                $script:ReconnectDelaySeconds = [int]$profileDelay
             } catch {
             }
         }
@@ -282,25 +282,25 @@ function Load-ProfileValues {
     if (-not $PSBoundParameters.ContainsKey("NoSyncAuth")) {
         $profileSync = Get-ProfileValue -Map $profileMap -Key "SYNC_AUTH"
         if ($profileSync -eq "0") {
-            $NoSyncAuth = $true
+            $script:NoSyncAuth = $true
         }
     }
 
     if (-not $PSBoundParameters.ContainsKey("RemoteScript")) {
-        $RemoteScript = Get-ProfileValue -Map $profileMap -Key "REMOTE_SCRIPT" -Fallback "/usr/local/bin/codex-vps"
+        $script:RemoteScript = Get-ProfileValue -Map $profileMap -Key "REMOTE_SCRIPT" -Fallback "/usr/local/bin/codex-vps"
     }
 
     if (-not $PSBoundParameters.ContainsKey("AuthMode")) {
         $profileAuth = Get-ProfileValue -Map $profileMap -Key "AUTH_MODE" -Fallback "auto"
         if ($profileAuth -in @("auto", "key", "password")) {
-            $AuthMode = $profileAuth
+            $script:AuthMode = $profileAuth
         }
     }
 
     if (-not $PSBoundParameters.ContainsKey("Password")) {
-        $Password = Decode-Base64 (Get-ProfileValue -Map $profileMap -Key "PASSWORD_B64")
-        if ([string]::IsNullOrWhiteSpace($Password)) {
-            $Password = Get-ProfileValue -Map $profileMap -Key "PASSWORD"
+        $script:Password = Decode-Base64 (Get-ProfileValue -Map $profileMap -Key "PASSWORD_B64")
+        if ([string]::IsNullOrWhiteSpace($script:Password)) {
+            $script:Password = Get-ProfileValue -Map $profileMap -Key "PASSWORD"
         }
     }
 }
@@ -318,8 +318,8 @@ function Ensure-RequiredConnectionValues {
     }
 
     if ($missing.Count -eq 0) {
-        if ([string]::IsNullOrWhiteSpace($HostAlias)) {
-            $HostAlias = "myvps"
+        if ([string]::IsNullOrWhiteSpace($script:HostAlias)) {
+            $script:HostAlias = "myvps"
         }
         return
     }
