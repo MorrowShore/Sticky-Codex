@@ -1834,7 +1834,7 @@ test_remote_prereqs() {
 
   remote_script_arg="$(quote_for_bash_single "$REMOTE_SCRIPT")"
   project_arg="$(quote_for_bash_single "$REMOTE_PROJECT_DIR")"
-  check_cmd="if [ ! -x $remote_script_arg ]; then echo 'remote script not found or not executable: $REMOTE_SCRIPT' >&2; exit 20; fi; if [ ! -d $project_arg ]; then echo 'remote project directory not found; creating: $REMOTE_PROJECT_DIR' >&2; if ! mkdir -p $project_arg; then echo 'failed to create remote project directory: $REMOTE_PROJECT_DIR' >&2; exit 21; fi; fi"
+  check_cmd="if [ ! -x $remote_script_arg ]; then echo 'remote script not found or not executable: $REMOTE_SCRIPT' >&2; exit 20; fi; if [ ! -d $project_arg ]; then echo 'remote project directory not found - creating: $REMOTE_PROJECT_DIR' >&2; if ! mkdir -p $project_arg; then echo 'failed to create remote project directory: $REMOTE_PROJECT_DIR' >&2; exit 21; fi; fi"
   check_cmd="$check_cmd; if ! command -v codex >/dev/null 2>&1; then echo 'codex is not installed or not in PATH on the remote host.' >&2; exit 22; fi"
   cmd="bash -lc $(quote_for_bash_single "$check_cmd")"
 

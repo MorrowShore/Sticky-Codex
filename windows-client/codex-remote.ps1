@@ -54,6 +54,11 @@ $script:NcatExe = "ncat"
 $script:SingBoxExe = "sing-box"
 $script:QuicRunner = $null
 $script:TunnelSshHost = ""
+$script:PuttyHostKeyPins = @()
+$script:CliBoundParams = @{}
+foreach ($k in $PSBoundParameters.Keys) {
+    $script:CliBoundParams[$k] = $true
+}
 
 function Show-Banner {
     Write-Host "Sticky Codex"
@@ -259,6 +264,7 @@ function Invoke-NativeCapture {
     $stderrPath = Join-Path $env:TEMP ("codex-native-err-" + [Guid]::NewGuid().ToString("N") + ".log")
     $oldNativePreference = $null
     $hasNativePreference = $false
+    $oldErrorAction = $ErrorActionPreference
 
     try {
         if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue) {
@@ -266,6 +272,7 @@ function Invoke-NativeCapture {
             $oldNativePreference = $global:PSNativeCommandUseErrorActionPreference
             $global:PSNativeCommandUseErrorActionPreference = $false
         }
+        $ErrorActionPreference = "Continue"
 
         & $FilePath @Arguments 1> $stdoutPath 2> $stderrPath
         $exitCode = $LASTEXITCODE
@@ -309,6 +316,7 @@ function Invoke-NativeCapture {
         if ($hasNativePreference) {
             $global:PSNativeCommandUseErrorActionPreference = $oldNativePreference
         }
+        $ErrorActionPreference = $oldErrorAction
         Remove-Item -Force -ErrorAction SilentlyContinue $stdoutPath, $stderrPath
     }
 }
@@ -520,7 +528,10 @@ function Build-NcatProxyCommand {
         $ncatCmd = '"' + ($ncatCmd -replace '"', '\"') + '"'
     }
 
-    $cmd = "$ncatCmd --proxy $($proxy.Host):$($proxy.Port) --proxy-type $type --no-shutdown"
+    $cmd = "$ncatCmd --proxy $($proxy.Host):$($proxy.Port) --proxy-type $type"
+    if ($script:SshBackend -ne "putty") {
+        $cmd += " --no-shutdown"
+    }
     if (-not [string]::IsNullOrWhiteSpace($proxy.Username)) {
         $cmd += " --proxy-auth $($proxy.Username):$($proxy.Password)"
     }
@@ -536,13 +547,13 @@ function Get-ShortWindowsPath {
         return $Path
     }
 
-    $escaped = $Path -replace '"', '""'
-    $out = (& cmd.exe /c "for %I in (""$escaped"") do @echo %~sI" 2>$null | Select-Object -First 1)
+    $arg = '/d /c for %I in ("' + $Path + '") do @echo %~sI'
+    $out = (& cmd.exe $arg 2>$null | Select-Object -First 1)
     $short = [string]$out
     if ([string]::IsNullOrWhiteSpace($short)) {
         return $Path
     }
-    return $short.Trim()
+    return $short.Trim().Trim('"')
 }
 
 function Normalize-NcatExePath {
@@ -554,6 +565,7 @@ function Normalize-NcatExePath {
     }
 
     if ($script:SshBackend -eq "putty") {
+        # Keep ncat in its original install directory so required DLLs resolve.
         $short = Get-ShortWindowsPath -Path $script:NcatExe
         if (-not [string]::IsNullOrWhiteSpace($short)) {
             $script:NcatExe = $short
@@ -1090,6 +1102,121 @@ function Get-PuttyProxyArgs {
     return @("-proxycmd", (Build-NcatProxyCommand -TargetHostToken "%host" -TargetPortToken "%port"))
 }
 
+function Get-Sha256PinsFromText {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return @()
+    }
+
+    $pins = @()
+    $seen = @{}
+    $matches = [regex]::Matches($Text, "SHA256:[A-Za-z0-9+/=]+")
+    foreach ($match in $matches) {
+        $pin = [string]$match.Value
+        if (-not [string]::IsNullOrWhiteSpace($pin) -and -not $seen.ContainsKey($pin)) {
+            $seen[$pin] = $true
+            $pins += $pin
+        }
+    }
+
+    return $pins
+}
+
+function Resolve-PuttyHostKeyPins {
+    param([string]$TargetHost)
+
+    $pins = @()
+    $sshKeyscan = Get-Command ssh-keyscan -ErrorAction SilentlyContinue
+    $sshKeygen = Get-Command ssh-keygen -ErrorAction SilentlyContinue
+    if ($sshKeyscan -and $sshKeygen) {
+        $scanPath = Join-Path $env:TEMP ("codex-hostkeys-" + [Guid]::NewGuid().ToString("N") + ".tmp")
+        try {
+            $scanOut = (& $sshKeyscan.Source "-p" "$Port" "-T" "8" $TargetHost 2>$null | Out-String)
+            if (-not [string]::IsNullOrWhiteSpace($scanOut)) {
+                Set-Content -Path $scanPath -Value $scanOut
+                $fingerprintOut = (& $sshKeygen.Source "-lf" $scanPath "-E" "sha256" 2>$null | Out-String)
+                $pins = Get-Sha256PinsFromText -Text $fingerprintOut
+            }
+        } catch {
+        } finally {
+            Remove-Item -Force -ErrorAction SilentlyContinue $scanPath
+        }
+    }
+
+    if ($pins.Count -gt 0) {
+        return $pins
+    }
+
+    foreach ($mode in @("direct", "proxy")) {
+        if ($mode -eq "proxy" -and ($script:ProxyType -eq "no" -or [string]::IsNullOrWhiteSpace($script:ProxySpec))) {
+            continue
+        }
+
+        $sshProbeArgs = @(
+            "-vv",
+            "-o", "BatchMode=yes",
+            "-o", "PreferredAuthentications=none",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-p", "$Port"
+        )
+        if ($mode -eq "proxy") {
+            $sshProbeArgs += @("-o", "ProxyCommand=$(Build-NcatProxyCommand -TargetHostToken '%h' -TargetPortToken '%p')")
+        }
+        $sshProbeArgs += @("$UserName@$TargetHost", "exit")
+
+        $sshProbe = Invoke-NativeCapture -FilePath "ssh" -Arguments $sshProbeArgs
+        $pins = Get-Sha256PinsFromText -Text ([string]$sshProbe.Output)
+        if ($pins.Count -gt 0) {
+            return $pins
+        }
+    }
+
+    foreach ($mode in @("direct", "proxy")) {
+        if ($mode -eq "proxy" -and ($script:ProxyType -eq "no" -or [string]::IsNullOrWhiteSpace($script:ProxySpec))) {
+            continue
+        }
+
+        $probeArgs = @("-ssh", "-batch", "-v", "-P", "$Port", "-l", $UserName)
+        if (-not [string]::IsNullOrWhiteSpace($IdentityFile)) {
+            $probeArgs += @("-i", $IdentityFile)
+        }
+        if ($AuthMode -eq "password" -and -not [string]::IsNullOrWhiteSpace($Password)) {
+            $probeArgs += @("-pw", $Password)
+        }
+        if ($mode -eq "proxy") {
+            $probeArgs += Get-PuttyProxyArgs
+        }
+        $probeArgs += @($TargetHost, "true")
+
+        $probe = Invoke-NativeCapture -FilePath $script:PlinkExe -Arguments $probeArgs
+        $pins = Get-Sha256PinsFromText -Text ([string]$probe.Output)
+        if ($pins.Count -gt 0) {
+            return $pins
+        }
+    }
+
+    return @()
+}
+
+function Get-PuttyHostKeyArgs {
+    if ($script:SshBackend -ne "putty") {
+        return @()
+    }
+
+    if ($null -eq $script:PuttyHostKeyPins -or $script:PuttyHostKeyPins.Count -eq 0) {
+        return @()
+    }
+
+    $args = @()
+    foreach ($pin in $script:PuttyHostKeyPins) {
+        if (-not [string]::IsNullOrWhiteSpace($pin)) {
+            $args += @("-hostkey", $pin)
+        }
+    }
+    return $args
+}
+
 function Resolve-PuttyToolsFromKnownLocations {
     $plink = Get-Command plink -ErrorAction SilentlyContinue
     $pscp = Get-Command pscp -ErrorAction SilentlyContinue
@@ -1350,7 +1477,7 @@ function Initialize-ProfileIfMissing {
 }
 
 function Resolve-ProfileFile {
-    if ($PSBoundParameters.ContainsKey("ProfileFile")) {
+    if ($script:CliBoundParams.ContainsKey("ProfileFile")) {
         return
     }
 
@@ -1421,7 +1548,7 @@ function Load-ProfileValues {
         $script:UserName = Get-ProfileValue -Map $profileMap -Key "USER_NAME"
     }
 
-    if (-not $PSBoundParameters.ContainsKey("Port")) {
+    if (-not $script:CliBoundParams.ContainsKey("Port")) {
         $profilePort = Get-ProfileValue -Map $profileMap -Key "PORT"
         if (-not [string]::IsNullOrWhiteSpace($profilePort)) {
             try {
@@ -1443,7 +1570,7 @@ function Load-ProfileValues {
         $script:SessionName = Get-ProfileValue -Map $profileMap -Key "SESSION_NAME"
     }
 
-    if (-not $PSBoundParameters.ContainsKey("IdleDays")) {
+    if (-not $script:CliBoundParams.ContainsKey("IdleDays")) {
         $profileIdle = Get-ProfileValue -Map $profileMap -Key "IDLE_DAYS"
         if (-not [string]::IsNullOrWhiteSpace($profileIdle)) {
             try {
@@ -1453,7 +1580,7 @@ function Load-ProfileValues {
         }
     }
 
-    if (-not $PSBoundParameters.ContainsKey("ReconnectDelaySeconds")) {
+    if (-not $script:CliBoundParams.ContainsKey("ReconnectDelaySeconds")) {
         $profileDelay = Get-ProfileValue -Map $profileMap -Key "RECONNECT_DELAY_SECONDS"
         if (-not [string]::IsNullOrWhiteSpace($profileDelay)) {
             try {
@@ -1463,46 +1590,46 @@ function Load-ProfileValues {
         }
     }
 
-    if (-not $PSBoundParameters.ContainsKey("NoSyncAuth")) {
+    if (-not $script:CliBoundParams.ContainsKey("NoSyncAuth")) {
         $profileSync = Get-ProfileValue -Map $profileMap -Key "SYNC_AUTH"
         if ($profileSync -eq "0") {
             $script:NoSyncAuth = $true
         }
     }
 
-    if (-not $PSBoundParameters.ContainsKey("RemoteScript")) {
+    if (-not $script:CliBoundParams.ContainsKey("RemoteScript")) {
         $script:RemoteScript = Get-ProfileValue -Map $profileMap -Key "REMOTE_SCRIPT" -Fallback "/usr/local/bin/codex-vps"
     }
 
-    if (-not $PSBoundParameters.ContainsKey("AuthMode")) {
+    if (-not $script:CliBoundParams.ContainsKey("AuthMode")) {
         $profileAuth = Get-ProfileValue -Map $profileMap -Key "AUTH_MODE" -Fallback "auto"
         if ($profileAuth -in @("auto", "key", "password")) {
             $script:AuthMode = $profileAuth
         }
     }
 
-    if (-not $PSBoundParameters.ContainsKey("Password")) {
+    if (-not $script:CliBoundParams.ContainsKey("Password")) {
         $script:Password = Decode-Base64 (Get-ProfileValue -Map $profileMap -Key "PASSWORD_B64")
         if ([string]::IsNullOrWhiteSpace($script:Password)) {
             $script:Password = Get-ProfileValue -Map $profileMap -Key "PASSWORD"
         }
     }
 
-    if (-not $PSBoundParameters.ContainsKey("ProxyType")) {
+    if (-not $script:CliBoundParams.ContainsKey("ProxyType")) {
         $profileProxyType = (Get-ProfileValue -Map $profileMap -Key "PROXY_TYPE" -Fallback "no").ToLowerInvariant()
         if ($profileProxyType -in @("no", "socks5", "http", "quic", "wss")) {
             $script:ProxyType = $profileProxyType
         }
     }
 
-    if (-not $PSBoundParameters.ContainsKey("ProxySpec")) {
+    if (-not $script:CliBoundParams.ContainsKey("ProxySpec")) {
         $script:ProxySpec = Get-ProfileValue -Map $profileMap -Key "PROXY_SPEC"
     }
 
-    if (-not $PSBoundParameters.ContainsKey("QuicServer")) {
+    if (-not $script:CliBoundParams.ContainsKey("QuicServer")) {
         $script:QuicServer = Get-ProfileValue -Map $profileMap -Key "QUIC_SERVER"
     }
-    if (-not $PSBoundParameters.ContainsKey("QuicPort")) {
+    if (-not $script:CliBoundParams.ContainsKey("QuicPort")) {
         $qp = Get-ProfileValue -Map $profileMap -Key "QUIC_PORT"
         if (-not [string]::IsNullOrWhiteSpace($qp)) {
             try {
@@ -1511,16 +1638,16 @@ function Load-ProfileValues {
             }
         }
     }
-    if (-not $PSBoundParameters.ContainsKey("QuicPassword")) {
+    if (-not $script:CliBoundParams.ContainsKey("QuicPassword")) {
         $script:QuicPassword = Decode-Base64 (Get-ProfileValue -Map $profileMap -Key "QUIC_PASSWORD_B64")
         if ([string]::IsNullOrWhiteSpace($script:QuicPassword)) {
             $script:QuicPassword = Get-ProfileValue -Map $profileMap -Key "QUIC_PASSWORD"
         }
     }
-    if (-not $PSBoundParameters.ContainsKey("QuicSni")) {
+    if (-not $script:CliBoundParams.ContainsKey("QuicSni")) {
         $script:QuicSni = Get-ProfileValue -Map $profileMap -Key "QUIC_SNI"
     }
-    if (-not $PSBoundParameters.ContainsKey("QuicLocalSocksPort")) {
+    if (-not $script:CliBoundParams.ContainsKey("QuicLocalSocksPort")) {
         $qlp = Get-ProfileValue -Map $profileMap -Key "QUIC_LOCAL_SOCKS_PORT"
         if (-not [string]::IsNullOrWhiteSpace($qlp)) {
             try {
@@ -1529,13 +1656,13 @@ function Load-ProfileValues {
             }
         }
     }
-    if (-not $PSBoundParameters.ContainsKey("QuicUpstreamType")) {
+    if (-not $script:CliBoundParams.ContainsKey("QuicUpstreamType")) {
         $profileQuicUpstreamType = (Get-ProfileValue -Map $profileMap -Key "QUIC_UPSTREAM_TYPE" -Fallback "no").ToLowerInvariant()
         if ($profileQuicUpstreamType -in @("no", "socks5", "http")) {
             $script:QuicUpstreamType = $profileQuicUpstreamType
         }
     }
-    if (-not $PSBoundParameters.ContainsKey("QuicUpstreamSpec")) {
+    if (-not $script:CliBoundParams.ContainsKey("QuicUpstreamSpec")) {
         $script:QuicUpstreamSpec = Get-ProfileValue -Map $profileMap -Key "QUIC_UPSTREAM_SPEC"
     }
 }
@@ -1751,42 +1878,78 @@ function Ensure-PuttyHostKeyCached {
     }
 
     $targetHost = Get-SshTargetHost
-    $batchArgs = @("-ssh", "-batch", "-P", "$Port", "-l", $UserName)
+
+    $baseArgs = @("-ssh", "-batch", "-P", "$Port", "-l", $UserName)
     if (-not [string]::IsNullOrWhiteSpace($IdentityFile)) {
-        $batchArgs += @("-i", $IdentityFile)
+        $baseArgs += @("-i", $IdentityFile)
     }
     if ($AuthMode -eq "password" -and -not [string]::IsNullOrWhiteSpace($Password)) {
-        $batchArgs += @("-pw", $Password)
+        $baseArgs += @("-pw", $Password)
     }
-    $batchArgs += Get-PuttyProxyArgs
-    $batchArgs += @($targetHost, "true")
+    $baseArgs += Get-PuttyProxyArgs
 
+    $pins = Resolve-PuttyHostKeyPins -TargetHost $targetHost
+    if ($pins.Count -gt 0) {
+        $script:PuttyHostKeyPins = $pins
+        Write-Host ("PuTTY host key pinned for {0}: {1}" -f $targetHost, ($pins -join ", "))
+    }
+
+    $batchArgs = @($baseArgs + (Get-PuttyHostKeyArgs) + @($targetHost, "true"))
     $batchResult = Invoke-NativeCapture -FilePath $script:PlinkExe -Arguments $batchArgs
-    $batchOutput = [string]$batchResult.Output
-    $batchExit = [int]$batchResult.ExitCode
-    if ($batchExit -eq 0) {
+    if ([int]$batchResult.ExitCode -eq 0) {
         return
     }
 
-    if ($batchOutput -notmatch "host key is not cached|cannot confirm a host key in batch mode") {
-        return
+    $discovered = Get-Sha256PinsFromText -Text ([string]$batchResult.Output)
+    if ($discovered.Count -eq 0) {
+        $probeArgs = @($baseArgs + @("-v", $targetHost, "true"))
+        $probe = Invoke-NativeCapture -FilePath $script:PlinkExe -Arguments $probeArgs
+        $discovered = Get-Sha256PinsFromText -Text ([string]$probe.Output)
+    }
+    if ($discovered.Count -eq 0) {
+        $probeText = ""
+        $oldNativePreference = $null
+        $hasNativePreference = $false
+        try {
+            if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue) {
+                $hasNativePreference = $true
+                $oldNativePreference = $global:PSNativeCommandUseErrorActionPreference
+                $global:PSNativeCommandUseErrorActionPreference = $false
+            }
+            $probeText = (& $script:PlinkExe @($baseArgs + @("-v", $targetHost, "true")) 2>&1 | Out-String)
+        } catch {
+            $msg = ""
+            if ($_.Exception -and -not [string]::IsNullOrWhiteSpace($_.Exception.Message)) {
+                $msg = $_.Exception.Message
+            } else {
+                $msg = ($_ | Out-String).Trim()
+            }
+            if ([string]::IsNullOrWhiteSpace($probeText)) {
+                $probeText = $msg
+            } else {
+                $probeText = ($probeText + [Environment]::NewLine + $msg).Trim()
+            }
+        } finally {
+            if ($hasNativePreference) {
+                $global:PSNativeCommandUseErrorActionPreference = $oldNativePreference
+            }
+        }
+        $discovered = Get-Sha256PinsFromText -Text $probeText
+    }
+    if ($discovered.Count -gt 0) {
+        $script:PuttyHostKeyPins = $discovered
+        Write-Host ("PuTTY host key pinned for {0}: {1}" -f $targetHost, ($discovered -join ", "))
+        $verifyArgs = @($baseArgs + (Get-PuttyHostKeyArgs) + @($targetHost, "true"))
+        $verify = Invoke-NativeCapture -FilePath $script:PlinkExe -Arguments $verifyArgs
+        if ([int]$verify.ExitCode -eq 0) {
+            return
+        }
     }
 
-    if (-not [Environment]::UserInteractive) {
-        throw "PuTTY host key for $targetHost is not cached. run one interactive plink connection first to trust this host key."
+    $lower = ([string]$batchResult.Output).ToLowerInvariant()
+    if ($lower -match "host key is not cached|cannot confirm a host key in batch mode|potential security breach|host identification has changed|host key does not match|store key in cache") {
+        Write-Host "warning: could not auto-pin the PuTTY host key fingerprint from probe output. falling back to cached host key behavior."
     }
-
-    Write-Host "PuTTY host key for $targetHost is not cached. confirming once interactively..."
-    $interactiveArgs = @("-ssh", "-P", "$Port", "-l", $UserName)
-    if (-not [string]::IsNullOrWhiteSpace($IdentityFile)) {
-        $interactiveArgs += @("-i", $IdentityFile)
-    }
-    if ($AuthMode -eq "password" -and -not [string]::IsNullOrWhiteSpace($Password)) {
-        $interactiveArgs += @("-pw", $Password)
-    }
-    $interactiveArgs += Get-PuttyProxyArgs
-    $interactiveArgs += @($targetHost, "exit")
-    & $script:PlinkExe @interactiveArgs
 }
 
 function Get-LocalCodexAuthPath {
@@ -1819,6 +1982,7 @@ function Invoke-RemoteSsh {
         }
 
         $args += Get-PuttyProxyArgs
+        $args += Get-PuttyHostKeyArgs
 
         $oldNativePreference = $null
         $hasNativePreference = $false
@@ -1894,6 +2058,7 @@ function Invoke-RemoteSshCapture {
             }
 
             $args += Get-PuttyProxyArgs
+            $args += Get-PuttyHostKeyArgs
 
             if ($Interactive) {
                 $args += @("-t", $targetHost, $RemoteCommand)
@@ -1968,6 +2133,7 @@ function Invoke-RemoteScp {
         }
 
         $args += Get-PuttyProxyArgs
+        $args += Get-PuttyHostKeyArgs
 
         $oldNativePreference = $null
         $hasNativePreference = $false
@@ -2244,7 +2410,7 @@ if [ ! -x $remoteScriptArg ]; then
   exit 20
 fi
 if [ ! -d $projectArg ]; then
-  echo "remote project directory not found; creating: $RemoteProjectDir" >&2
+  echo "remote project directory not found - creating: $RemoteProjectDir" >&2
   if ! mkdir -p $projectArg; then
     echo "failed to create remote project directory: $RemoteProjectDir" >&2
     exit 21
