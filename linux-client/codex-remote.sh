@@ -52,6 +52,7 @@ PROFILE_FILE_SET="0"
 QUIC_SINGBOX_BIN=""
 QUIC_PID=""
 QUIC_TMP_DIR=""
+TUNNEL_SSH_HOST=""
 
 usage() {
   cat <<'EOF'
@@ -70,7 +71,7 @@ options:
   --reconnect-delay-seconds 3
   --auth-mode auto|key|password
   --password VALUE
-  --proxy-type no|socks5|http|quic
+  --proxy-type no|socks5|http|quic|wss
   --proxy-spec host:port[:username:password]
   --quic-server HOST
   --quic-port 61313
@@ -188,7 +189,7 @@ build_proxy_command() {
     type="http"
   fi
 
-  cmd="ncat --proxy ${PROXY_HOST}:${PROXY_PORT} --proxy-type ${type}"
+  cmd="ncat --proxy ${PROXY_HOST}:${PROXY_PORT} --proxy-type ${type} --no-shutdown"
   if [ -n "$PROXY_USER" ]; then
     cmd="$cmd --proxy-auth ${PROXY_USER}:${PROXY_PASS}"
   fi
@@ -358,7 +359,7 @@ prompt_with_default() {
   local answer=""
 
   if [ -n "$default_value" ]; then
-    read -r -p "$prompt_text [$default_value]: " answe
+    read -r -p "$prompt_text [$default_value]: " answer
     if [ -z "$answer" ]; then
       printf '%s\n' "$default_value"
       return
@@ -367,7 +368,7 @@ prompt_with_default() {
     return
   fi
 
-  read -r -p "$prompt_text: " answe
+  read -r -p "$prompt_text: " answer
   printf '%s\n' "$answer"
 }
 
@@ -525,64 +526,81 @@ initialize_profile_if_missing() {
       ;;
   esac
 
+  local upstream_default upstream_type upstream_spec use_quic_choice
+  upstream_default="no"
+  if [ "$PROXY_TYPE" = "socks5" ] || [ "$PROXY_TYPE" = "http" ]; then
+    upstream_default="$PROXY_TYPE"
+  elif { [ "$PROXY_TYPE" = "quic" ] || [ "$PROXY_TYPE" = "wss" ]; } && { [ "$QUIC_UPSTREAM_TYPE" = "no" ] || [ "$QUIC_UPSTREAM_TYPE" = "socks5" ] || [ "$QUIC_UPSTREAM_TYPE" = "http" ]; }; then
+    upstream_default="$QUIC_UPSTREAM_TYPE"
+  fi
+
   while true; do
-    proxy_choice="$(prompt_with_default "Run through proxy? [no]  no/socks5/http/quic" "$PROXY_TYPE")"
-    PROXY_TYPE="$(printf '%s' "$proxy_choice" | tr '[:upper:]' '[:lower:]')"
-    case "$PROXY_TYPE" in
-      no|socks5|http|quic)
+    upstream_type="$(prompt_with_default "Use upstream proxy? [no]  no/socks5/http" "$upstream_default")"
+    upstream_type="$(printf '%s' "$upstream_type" | tr '[:upper:]' '[:lower:]')"
+    case "$upstream_type" in
+      no|socks5|http)
         break
         ;;
       *)
-        echo "please enter no, socks5, http, or quic." >&2
+        echo "please enter no, socks5, or http." >&2
         ;;
     esac
   done
 
-  if [ "$PROXY_TYPE" = "socks5" ] || [ "$PROXY_TYPE" = "http" ]; then
-    PROXY_SPEC="$(prompt_required "proxy address (host:port or host:port:username:password)" "$PROXY_SPEC")"
-    QUIC_SERVER=""
-    QUIC_PORT="61313"
-    QUIC_PASSWORD=""
-    QUIC_SNI=""
-    QUIC_LOCAL_SOCKS_PORT="10809"
-    QUIC_UPSTREAM_TYPE="no"
-    QUIC_UPSTREAM_SPEC=""
-  elif [ "$PROXY_TYPE" = "quic" ]; then
-    QUIC_SERVER="$(prompt_with_default "quic server host" "${QUIC_SERVER:-$HOST_NAME}")"
-    QUIC_PORT="$(prompt_with_default "quic server port" "${QUIC_PORT:-61313}")"
+  upstream_spec=""
+  if [ "$upstream_type" = "socks5" ] || [ "$upstream_type" = "http" ]; then
+    local upstream_spec_default
+    upstream_spec_default="$PROXY_SPEC"
+    if [ "$PROXY_TYPE" = "quic" ] || [ "$PROXY_TYPE" = "wss" ]; then
+      upstream_spec_default="$QUIC_UPSTREAM_SPEC"
+    fi
+    upstream_spec="$(prompt_required "upstream proxy address (host:port or host:port:username:password)" "$upstream_spec_default")"
+  fi
+
+  while true; do
+    use_quic_choice="$(prompt_with_default "Use wss stability layer? [n] y/n" "n")"
+    use_quic_choice="$(printf '%s' "$use_quic_choice" | tr '[:upper:]' '[:lower:]')"
+    case "$use_quic_choice" in
+      y|yes|n|no)
+        break
+        ;;
+      *)
+        echo "please enter y or n." >&2
+        ;;
+    esac
+  done
+
+  if [ "$use_quic_choice" = "y" ] || [ "$use_quic_choice" = "yes" ]; then
+    PROXY_TYPE="wss"
+    QUIC_SERVER="$(prompt_with_default "wss server host" "${QUIC_SERVER:-$HOST_NAME}")"
+    if [ -z "${QUIC_PORT:-}" ] || [ "$QUIC_PORT" = "61313" ]; then
+      QUIC_PORT="13131"
+    fi
+    QUIC_PORT="$(prompt_with_default "wss server port" "${QUIC_PORT:-13131}")"
     if [ -n "$QUIC_PASSWORD" ]; then
-      read -r -s -p "quic password (stored in profile) [previous password]: " QUIC_PASSWORD_INPUT
+      read -r -s -p "wss password (stored in profile) [previous password]: " QUIC_PASSWORD_INPUT
       printf '\n'
       if [ -n "$QUIC_PASSWORD_INPUT" ]; then
         QUIC_PASSWORD="$QUIC_PASSWORD_INPUT"
       fi
     else
-      read -r -s -p "quic password (stored in profile): " QUIC_PASSWORD
+      read -r -s -p "wss password (stored in profile): " QUIC_PASSWORD
       printf '\n'
     fi
     unset QUIC_PASSWORD_INPUT
-    QUIC_SNI="$(prompt_with_default "quic tls sni (blank=server host)" "${QUIC_SNI:-$QUIC_SERVER}")"
-    QUIC_LOCAL_SOCKS_PORT="$(prompt_with_default "local socks port for quic tunnel" "${QUIC_LOCAL_SOCKS_PORT:-10809}")"
-    while true; do
-      QUIC_UPSTREAM_TYPE="$(prompt_with_default "quic upstream proxy mode [no]  no/socks5/http" "${QUIC_UPSTREAM_TYPE:-no}")"
-      QUIC_UPSTREAM_TYPE="$(printf '%s' "$QUIC_UPSTREAM_TYPE" | tr '[:upper:]' '[:lower:]')"
-      case "$QUIC_UPSTREAM_TYPE" in
-        no|socks5|http)
-          break
-          ;;
-        *)
-          echo "please enter no, socks5, or http." >&2
-          ;;
-      esac
-    done
-    if [ "$QUIC_UPSTREAM_TYPE" = "socks5" ] || [ "$QUIC_UPSTREAM_TYPE" = "http" ]; then
-      QUIC_UPSTREAM_SPEC="$(prompt_required "quic upstream proxy address (host:port or host:port:username:password)" "$QUIC_UPSTREAM_SPEC")"
-    else
-      QUIC_UPSTREAM_SPEC=""
+    QUIC_SNI="$(prompt_with_default "wss tls sni (blank=server host)" "${QUIC_SNI:-$QUIC_SERVER}")"
+    local wss_local_default
+    wss_local_default="${QUIC_LOCAL_SOCKS_PORT:-10809}"
+    if [ "$wss_local_default" = "10809" ]; then
+      wss_local_default="10819"
     fi
+    QUIC_LOCAL_SOCKS_PORT="$(prompt_with_default "local socks port for wss tunnel" "$wss_local_default")"
+    QUIC_UPSTREAM_TYPE="$upstream_type"
+    QUIC_UPSTREAM_SPEC="$upstream_spec"
     PROXY_SPEC=""
   else
-    PROXY_SPEC=""
+    PROXY_TYPE="$upstream_type"
+    PROXY_SPEC="$upstream_spec"
     QUIC_SERVER=""
     QUIC_PORT="61313"
     QUIC_PASSWORD=""
@@ -618,10 +636,10 @@ ensure_required_connection_values() {
     fi
     [ -n "$PROXY_TYPE" ] || PROXY_TYPE="no"
     case "$PROXY_TYPE" in
-      no|socks5|http|quic)
+      no|socks5|http|quic|wss)
         ;;
       *)
-        echo "invalid proxy type: $PROXY_TYPE (expected no|socks5|http|quic)" >&2
+        echo "invalid proxy type: $PROXY_TYPE (expected no|socks5|http|quic|wss)" >&2
         exit 1
         ;;
     esac
@@ -629,46 +647,57 @@ ensure_required_connection_values() {
       echo "proxy is enabled but proxy spec is empty." >&2
       exit 1
     fi
-    if [ "$PROXY_TYPE" = "quic" ]; then
+    if [ "$PROXY_TYPE" = "quic" ] || [ "$PROXY_TYPE" = "wss" ]; then
       [ -n "$QUIC_SERVER" ] || QUIC_SERVER="$HOST_NAME"
-      [ -n "$QUIC_PORT" ] || QUIC_PORT="61313"
+      if [ -z "$QUIC_PORT" ]; then
+        if [ "$PROXY_TYPE" = "wss" ]; then
+          QUIC_PORT="13131"
+        else
+          QUIC_PORT="61313"
+        fi
+      elif [ "$PROXY_TYPE" = "wss" ] && [ "$QUIC_PORT" = "61313" ]; then
+        QUIC_PORT="13131"
+      fi
       [ -n "$QUIC_LOCAL_SOCKS_PORT" ] || QUIC_LOCAL_SOCKS_PORT="10809"
+      if [ "$PROXY_TYPE" = "wss" ] && [ "$QUIC_LOCAL_SOCKS_PORT" = "10809" ]; then
+        QUIC_LOCAL_SOCKS_PORT="10819"
+      fi
       [ -n "$QUIC_UPSTREAM_TYPE" ] || QUIC_UPSTREAM_TYPE="no"
       QUIC_UPSTREAM_TYPE="$(printf '%s' "$QUIC_UPSTREAM_TYPE" | tr '[:upper:]' '[:lower:]')"
       if [ -z "$QUIC_PASSWORD" ]; then
-        echo "proxy type 'quic' requires QUIC_PASSWORD_B64 (or --quic-password)." >&2
+        echo "proxy type '$PROXY_TYPE' requires QUIC_PASSWORD_B64 (or --quic-password)." >&2
         exit 1
       fi
       case "$QUIC_PORT" in
         ''|*[!0-9]*)
-          echo "proxy type 'quic' requires numeric QUIC_PORT (1-65535)." >&2
+          echo "proxy type '$PROXY_TYPE' requires numeric QUIC_PORT (1-65535)." >&2
           exit 1
           ;;
       esac
       if [ "$QUIC_PORT" -lt 1 ] || [ "$QUIC_PORT" -gt 65535 ]; then
-        echo "proxy type 'quic' requires QUIC_PORT in range 1-65535." >&2
+        echo "proxy type '$PROXY_TYPE' requires QUIC_PORT in range 1-65535." >&2
         exit 1
       fi
       case "$QUIC_LOCAL_SOCKS_PORT" in
         ''|*[!0-9]*)
-          echo "proxy type 'quic' requires numeric QUIC_LOCAL_SOCKS_PORT (1-65535)." >&2
+          echo "proxy type '$PROXY_TYPE' requires numeric QUIC_LOCAL_SOCKS_PORT (1-65535)." >&2
           exit 1
           ;;
       esac
       if [ "$QUIC_LOCAL_SOCKS_PORT" -lt 1 ] || [ "$QUIC_LOCAL_SOCKS_PORT" -gt 65535 ]; then
-        echo "proxy type 'quic' requires QUIC_LOCAL_SOCKS_PORT in range 1-65535." >&2
+        echo "proxy type '$PROXY_TYPE' requires QUIC_LOCAL_SOCKS_PORT in range 1-65535." >&2
         exit 1
       fi
       case "$QUIC_UPSTREAM_TYPE" in
         no|socks5|http)
           ;;
         *)
-          echo "proxy type 'quic' has invalid QUIC_UPSTREAM_TYPE: $QUIC_UPSTREAM_TYPE (expected no|socks5|http)." >&2
+          echo "proxy type '$PROXY_TYPE' has invalid QUIC_UPSTREAM_TYPE: $QUIC_UPSTREAM_TYPE (expected no|socks5|http)." >&2
           exit 1
           ;;
       esac
       if { [ "$QUIC_UPSTREAM_TYPE" = "socks5" ] || [ "$QUIC_UPSTREAM_TYPE" = "http" ]; } && [ -z "$QUIC_UPSTREAM_SPEC" ]; then
-        echo "proxy type 'quic' with upstream mode '$QUIC_UPSTREAM_TYPE' requires QUIC_UPSTREAM_SPEC." >&2
+        echo "proxy type '$PROXY_TYPE' with upstream mode '$QUIC_UPSTREAM_TYPE' requires QUIC_UPSTREAM_SPEC." >&2
         exit 1
       fi
     fi
@@ -1151,6 +1180,37 @@ tcp_port_open() {
   bash -lc "echo > /dev/tcp/$host/$port" >/dev/null 2>&1
 }
 
+find_available_local_socks_port() {
+  local preferred="$1"
+  local search_window=200
+  local candidate
+
+  case "$preferred" in
+    ''|*[!0-9]*)
+      preferred=10809
+      ;;
+  esac
+  if [ "$preferred" -lt 1 ] || [ "$preferred" -gt 65535 ]; then
+    preferred=10809
+  fi
+
+  if ! tcp_port_open "127.0.0.1" "$preferred"; then
+    printf '%s\n' "$preferred"
+    return 0
+  fi
+
+  candidate=$(( preferred + 1 ))
+  while [ "$candidate" -le 65535 ] && [ "$candidate" -le $(( preferred + search_window )) ]; do
+    if ! tcp_port_open "127.0.0.1" "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    candidate=$(( candidate + 1 ))
+  done
+
+  return 1
+}
+
 start_quic_local_proxy_if_configured() {
   local quic_config_path escaped_server escaped_password escaped_sni
   local upstream_outbound upstream_detour upstream_type
@@ -1188,9 +1248,14 @@ start_quic_local_proxy_if_configured() {
   fi
 
   if tcp_port_open "127.0.0.1" "$QUIC_LOCAL_SOCKS_PORT"; then
-    PROXY_TYPE="socks5"
-    PROXY_SPEC="127.0.0.1:$QUIC_LOCAL_SOCKS_PORT"
-    return
+    local next_port
+    next_port="$(find_available_local_socks_port "$QUIC_LOCAL_SOCKS_PORT" || true)"
+    if [ -z "$next_port" ]; then
+      echo "local port $QUIC_LOCAL_SOCKS_PORT is already in use and no free nearby port was found for quic tunnel." >&2
+      exit 1
+    fi
+    echo "local port $QUIC_LOCAL_SOCKS_PORT is already in use; quic tunnel will use $next_port."
+    QUIC_LOCAL_SOCKS_PORT="$next_port"
   fi
 
   QUIC_TMP_DIR="$(mktemp -d)"
@@ -1282,6 +1347,7 @@ EOF
     if tcp_port_open "127.0.0.1" "$QUIC_LOCAL_SOCKS_PORT"; then
       PROXY_TYPE="socks5"
       PROXY_SPEC="127.0.0.1:$QUIC_LOCAL_SOCKS_PORT"
+      TUNNEL_SSH_HOST="127.0.0.1"
       return
     fi
     if ! kill -0 "$QUIC_PID" >/dev/null 2>&1; then
@@ -1293,6 +1359,157 @@ EOF
   exit 1
 }
 
+start_wss_local_proxy_if_configured() {
+  local wss_config_path escaped_server escaped_password escaped_sni
+  local upstream_outbound upstream_detour upstream_type
+  local escaped_upstream_host escaped_upstream_user escaped_upstream_pass
+
+  if [ "$PROXY_TYPE" != "wss" ]; then
+    return
+  fi
+
+  [ -n "$QUIC_SERVER" ] || QUIC_SERVER="$HOST_NAME"
+  [ -n "$QUIC_PORT" ] || QUIC_PORT="13131"
+  [ -n "$QUIC_LOCAL_SOCKS_PORT" ] || QUIC_LOCAL_SOCKS_PORT="10809"
+  [ -n "$QUIC_SNI" ] || QUIC_SNI="$QUIC_SERVER"
+  [ -n "$QUIC_UPSTREAM_TYPE" ] || QUIC_UPSTREAM_TYPE="no"
+
+  if [ -z "$QUIC_PASSWORD" ]; then
+    echo "wss proxy mode requires QUIC_PASSWORD." >&2
+    exit 1
+  fi
+
+  if ! resolve_sing_box_bin && [ -t 0 ]; then
+    local install_wss_core_choice
+    install_wss_core_choice="$(prompt_with_default "wss core (sing-box) is missing on this client. install now? (Y/n)" "Y")"
+    case "$(printf '%s' "$install_wss_core_choice" | tr '[:upper:]' '[:lower:]')" in
+      n|no)
+        echo "wss mode needs sing-box on the client. install was skipped by user." >&2
+        exit 1
+        ;;
+    esac
+  fi
+
+  if ! install_sing_box_client; then
+    echo "failed to install sing-box client automatically for wss proxy mode." >&2
+    exit 1
+  fi
+
+  if tcp_port_open "127.0.0.1" "$QUIC_LOCAL_SOCKS_PORT"; then
+    local next_port
+    next_port="$(find_available_local_socks_port "$QUIC_LOCAL_SOCKS_PORT" || true)"
+    if [ -z "$next_port" ]; then
+      echo "local port $QUIC_LOCAL_SOCKS_PORT is already in use and no free nearby port was found for wss tunnel." >&2
+      exit 1
+    fi
+    echo "local port $QUIC_LOCAL_SOCKS_PORT is already in use; wss tunnel will use $next_port."
+    QUIC_LOCAL_SOCKS_PORT="$next_port"
+  fi
+
+  QUIC_TMP_DIR="$(mktemp -d)"
+  wss_config_path="$QUIC_TMP_DIR/sing-box-wss-client.json"
+  escaped_server="$(json_escape "$QUIC_SERVER")"
+  escaped_password="$(json_escape "$QUIC_PASSWORD")"
+  escaped_sni="$(json_escape "$QUIC_SNI")"
+  upstream_outbound=""
+  upstream_detour=""
+
+  case "$QUIC_UPSTREAM_TYPE" in
+    no)
+      ;;
+    socks5|http)
+      if [ -z "$QUIC_UPSTREAM_SPEC" ]; then
+        echo "wss upstream proxy mode '$QUIC_UPSTREAM_TYPE' requires QUIC_UPSTREAM_SPEC." >&2
+        exit 1
+      fi
+      parse_proxy_spec "$QUIC_UPSTREAM_SPEC"
+      escaped_upstream_host="$(json_escape "$PROXY_HOST")"
+      escaped_upstream_user="$(json_escape "$PROXY_USER")"
+      escaped_upstream_pass="$(json_escape "$PROXY_PASS")"
+      if [ "$QUIC_UPSTREAM_TYPE" = "socks5" ]; then
+        upstream_type="socks"
+      else
+        upstream_type="http"
+      fi
+      if [ -n "$PROXY_USER" ]; then
+        upstream_outbound=",
+    {
+      \"type\": \"$upstream_type\",
+      \"tag\": \"wss-upstream\",
+      \"server\": \"$escaped_upstream_host\",
+      \"server_port\": $PROXY_PORT,
+      \"username\": \"$escaped_upstream_user\",
+      \"password\": \"$escaped_upstream_pass\"
+    }"
+      else
+        upstream_outbound=",
+    {
+      \"type\": \"$upstream_type\",
+      \"tag\": \"wss-upstream\",
+      \"server\": \"$escaped_upstream_host\",
+      \"server_port\": $PROXY_PORT
+    }"
+      fi
+      upstream_detour=", \"detour\": \"wss-upstream\""
+      ;;
+    *)
+      echo "invalid wss upstream type: $QUIC_UPSTREAM_TYPE (expected no|socks5|http)." >&2
+      exit 1
+      ;;
+  esac
+
+  cat > "$wss_config_path" <<EOF
+{
+  "log": { "level": "warn" },
+  "inbounds": [
+    {
+      "type": "socks",
+      "listen": "127.0.0.1",
+      "listen_port": $QUIC_LOCAL_SOCKS_PORT
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "trojan",
+      "tag": "wss-out",
+      "server": "$escaped_server",
+      "server_port": $QUIC_PORT,
+      "password": "$escaped_password",
+      "tls": {
+        "enabled": true,
+        "server_name": "$escaped_sni",
+        "insecure": true
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/sticky-codex"
+      }$upstream_detour
+    }
+    $upstream_outbound
+  ],
+  "route": { "final": "wss-out" }
+}
+EOF
+
+  "$QUIC_SINGBOX_BIN" run -c "$wss_config_path" >/dev/null 2>&1 &
+  QUIC_PID="$!"
+
+  for _ in $(seq 1 20); do
+    sleep 0.5
+    if tcp_port_open "127.0.0.1" "$QUIC_LOCAL_SOCKS_PORT"; then
+      PROXY_TYPE="socks5"
+      PROXY_SPEC="127.0.0.1:$QUIC_LOCAL_SOCKS_PORT"
+      TUNNEL_SSH_HOST="127.0.0.1"
+      return
+    fi
+    if ! kill -0 "$QUIC_PID" >/dev/null 2>&1; then
+      break
+    fi
+  done
+
+  echo "failed to start local wss tunnel client (sing-box)." >&2
+  exit 1
+}
 ensure_codex() {
   if has_command codex; then
     return
@@ -1427,10 +1644,11 @@ quote_for_bash_single() {
 }
 
 write_temp_ssh_config() {
-  local proxy_command
+  local proxy_command ssh_host_for_tunnel
+  ssh_host_for_tunnel="${TUNNEL_SSH_HOST:-$HOST_NAME}"
   {
     printf 'Host %s\n' "$HOST_ALIAS"
-    printf '    HostName %s\n' "$HOST_NAME"
+    printf '    HostName %s\n' "$ssh_host_for_tunnel"
     printf '    User %s\n' "$USER_NAME"
     printf '    Port %s\n' "$PORT"
     printf '    ServerAliveInterval 15\n'
@@ -1601,6 +1819,7 @@ ensure_codex
 
 SSH_CONFIG_PATH="$(mktemp)"
 trap cleanup_local_helpers EXIT
+start_wss_local_proxy_if_configured
 start_quic_local_proxy_if_configured
 ensure_ncat_if_proxy_configured
 

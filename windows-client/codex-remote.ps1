@@ -31,7 +31,7 @@ param(
     [ValidateSet("auto", "key", "password")]
     [string]$AuthMode = "auto",
     [string]$Password = "",
-    [ValidateSet("no", "socks5", "http", "quic")]
+    [ValidateSet("no", "socks5", "http", "quic", "wss")]
     [string]$ProxyType = "no",
     [string]$ProxySpec = "",
     [string]$QuicServer = "",
@@ -53,6 +53,7 @@ $script:PscpExe = "pscp"
 $script:NcatExe = "ncat"
 $script:SingBoxExe = "sing-box"
 $script:QuicRunner = $null
+$script:TunnelSshHost = ""
 
 function Show-Banner {
     Write-Host "Sticky Codex"
@@ -78,7 +79,7 @@ options:
   -ReconnectDelaySeconds 3
   -AuthMode auto|key|password
   -Password yourpassword
-  -ProxyType no|socks5|http|quic
+  -ProxyType no|socks5|http|quic|wss
   -ProxySpec 127.0.0.1:8080[:username:password]
   -QuicServer your.vps.host
   -QuicPort 61313
@@ -443,12 +444,13 @@ function Build-NcatProxyCommand {
 
     $proxy = Parse-ProxySpec -Spec $script:ProxySpec
     $type = if ($script:ProxyType -eq "socks5") { "socks5" } else { "http" }
+    Normalize-NcatExePath
     $ncatCmd = $script:NcatExe
     if ($ncatCmd -match "\s") {
         $ncatCmd = '"' + ($ncatCmd -replace '"', '\"') + '"'
     }
 
-    $cmd = "$ncatCmd --proxy $($proxy.Host):$($proxy.Port) --proxy-type $type"
+    $cmd = "$ncatCmd --proxy $($proxy.Host):$($proxy.Port) --proxy-type $type --no-shutdown"
     if (-not [string]::IsNullOrWhiteSpace($proxy.Username)) {
         $cmd += " --proxy-auth $($proxy.Username):$($proxy.Password)"
     }
@@ -457,16 +459,54 @@ function Build-NcatProxyCommand {
     return $cmd
 }
 
+function Get-ShortWindowsPath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path $Path)) {
+        return $Path
+    }
+
+    $escaped = $Path -replace '"', '""'
+    $out = (& cmd.exe /c "for %I in (""$escaped"") do @echo %~sI" 2>$null | Select-Object -First 1)
+    $short = [string]$out
+    if ([string]::IsNullOrWhiteSpace($short)) {
+        return $Path
+    }
+    return $short.Trim()
+}
+
+function Normalize-NcatExePath {
+    if ([string]::IsNullOrWhiteSpace($script:NcatExe)) {
+        return
+    }
+    if ($script:NcatExe -notmatch "\s") {
+        return
+    }
+
+    if ($script:SshBackend -eq "putty") {
+        $short = Get-ShortWindowsPath -Path $script:NcatExe
+        if (-not [string]::IsNullOrWhiteSpace($short)) {
+            $script:NcatExe = $short
+        }
+    }
+}
+
 function Resolve-NcatExe {
     $ncat = Get-Command ncat -ErrorAction SilentlyContinue
     if ($ncat) {
         $script:NcatExe = $ncat.Source
+        Normalize-NcatExePath
         return $true
     }
 
-    foreach ($candidate in @("$env:ProgramFiles\Nmap\ncat.exe", "${env:ProgramFiles(x86)}\Nmap\ncat.exe")) {
+    foreach ($candidate in @(
+        "$env:ProgramFiles\Nmap\ncat.exe",
+        "${env:ProgramFiles(x86)}\Nmap\ncat.exe",
+        (Join-Path $env:LOCALAPPDATA "sticky-codex\tools\nmap-portable\ncat.exe")
+    )) {
         if (Test-Path $candidate) {
             $script:NcatExe = $candidate
+            Normalize-NcatExePath
             return $true
         }
     }
@@ -478,6 +518,7 @@ function Resolve-NcatExe {
                 $found = Get-ChildItem -Path $pkgDir.FullName -Filter "ncat.exe" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($found) {
                     $script:NcatExe = $found.FullName
+                    Normalize-NcatExePath
                     return $true
                 }
             }
@@ -485,6 +526,70 @@ function Resolve-NcatExe {
     }
 
     return $false
+}
+
+function Download-NcatPortable {
+    $toolDir = Join-Path $env:LOCALAPPDATA "sticky-codex\tools"
+    $null = New-Item -ItemType Directory -Force -Path $toolDir
+
+    $index = ""
+    $gotIndex = Invoke-WithRetry -Label "fetch nmap dist index" -Attempts 5 -BaseDelaySeconds 6 -Action {
+        $index = (& curl.exe -fsSL "https://nmap.org/dist/" 2>$null | Out-String)
+        if ([string]::IsNullOrWhiteSpace($index)) {
+            throw "empty nmap dist index response"
+        }
+    }
+    if (-not $gotIndex -or [string]::IsNullOrWhiteSpace($index)) {
+        return $false
+    }
+
+    $matches = [regex]::Matches($index, 'nmap-[0-9A-Za-z\.\-]+-win32\.zip')
+    if ($matches.Count -eq 0) {
+        return $false
+    }
+
+    $assetName = $matches[0].Value
+    $assetUrl = "https://nmap.org/dist/$assetName"
+    $zipPath = Join-Path $toolDir "nmap-portable.zip"
+    $extractDir = Join-Path $toolDir "nmap-portable-extract"
+    if (Test-Path $extractDir) {
+        Remove-Item -Recurse -Force $extractDir
+    }
+
+    $downloaded = Invoke-WithRetry -Label "download nmap portable package" -Attempts 6 -BaseDelaySeconds 6 -Action {
+        & curl.exe -fL $assetUrl -o $zipPath
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $zipPath)) {
+            throw "failed to download $assetUrl"
+        }
+    }
+    if (-not $downloaded) {
+        return $false
+    }
+
+    try {
+        Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+    } catch {
+        return $false
+    }
+
+    $ncatFile = Get-ChildItem -Path $extractDir -Filter "ncat.exe" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $ncatFile) {
+        return $false
+    }
+
+    $srcDir = Split-Path -Parent $ncatFile.FullName
+    $destDir = Join-Path $toolDir "nmap-portable"
+    if (Test-Path $destDir) {
+        Remove-Item -Recurse -Force $destDir
+    }
+    New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+    Copy-Item -Path (Join-Path $srcDir "*") -Destination $destDir -Recurse -Force
+    $dest = Join-Path $destDir "ncat.exe"
+    if (-not (Test-Path $dest)) {
+        return $false
+    }
+    $script:NcatExe = $dest
+    return $true
 }
 
 function Ensure-NcatForProxy {
@@ -520,6 +625,10 @@ function Ensure-NcatForProxy {
     }
 
     if (-not (Resolve-NcatExe)) {
+        Write-Host "ncat was not found after winget attempts. trying portable download from nmap.org..."
+        if (Download-NcatPortable -and (Resolve-NcatExe)) {
+            return
+        }
         if (-not $winget) {
             throw "proxy mode requires ncat, and winget is not available on this machine. install Nmap (ncat) manually, then retry."
         }
@@ -623,9 +732,9 @@ function Ensure-SingBox {
     }
 
     if ([Environment]::UserInteractive) {
-        $choice = (Prompt-WithDefault -Prompt "quic core (sing-box) is missing on this client. install now? (Y/n)" -Default "Y").ToLowerInvariant()
+        $choice = (Prompt-WithDefault -Prompt "stability core (sing-box) is missing on this client. install now? (Y/n)" -Default "Y").ToLowerInvariant()
         if ($choice -in @("n", "no")) {
-            throw "quic mode requires sing-box on this client. install was skipped by user."
+            throw "stability mode requires sing-box on this client. install was skipped by user."
         }
     }
 
@@ -646,7 +755,7 @@ function Ensure-SingBox {
         return
     }
 
-    throw "quic mode requires sing-box, but it could not be installed automatically."
+    throw "stability mode requires sing-box, but it could not be installed automatically."
 }
 
 function Test-TcpPort {
@@ -671,6 +780,38 @@ function Test-TcpPort {
     }
 }
 
+function Get-AvailableLocalSocksPort {
+    param(
+        [int]$PreferredPort,
+        [int]$SearchWindow = 200
+    )
+
+    if ($PreferredPort -lt 1 -or $PreferredPort -gt 65535) {
+        $PreferredPort = 10809
+    }
+
+    if (-not (Test-TcpPort -Host "127.0.0.1" -Port $PreferredPort -TimeoutMs 500)) {
+        return $PreferredPort
+    }
+
+    $start = [Math]::Min(65535, $PreferredPort + 1)
+    $end = [Math]::Min(65535, $PreferredPort + $SearchWindow)
+    for ($p = $start; $p -le $end; $p++) {
+        if (-not (Test-TcpPort -Host "127.0.0.1" -Port $p -TimeoutMs 500)) {
+            return $p
+        }
+    }
+
+    throw "could not find a free local socks port near $PreferredPort for stability tunnel."
+}
+
+function Get-SshTargetHost {
+    if (-not [string]::IsNullOrWhiteSpace($script:TunnelSshHost)) {
+        return $script:TunnelSshHost
+    }
+    return $HostName
+}
+
 function Ensure-QuicLocalProxy {
     if ($script:ProxyType -ne "quic") {
         return
@@ -686,9 +827,9 @@ function Ensure-QuicLocalProxy {
     Ensure-SingBox
 
     if (Test-TcpPort -Host "127.0.0.1" -Port $script:QuicLocalSocksPort -TimeoutMs 900) {
-        $script:ProxyType = "socks5"
-        $script:ProxySpec = "127.0.0.1:$script:QuicLocalSocksPort"
-        return
+        $nextPort = Get-AvailableLocalSocksPort -PreferredPort $script:QuicLocalSocksPort
+        Write-Host "local port $script:QuicLocalSocksPort is already in use; quic tunnel will use $nextPort."
+        $script:QuicLocalSocksPort = $nextPort
     }
 
     $tmpDir = Join-Path $env:TEMP "codex-remote"
@@ -756,6 +897,7 @@ function Ensure-QuicLocalProxy {
         if (Test-TcpPort -Host "127.0.0.1" -Port $script:QuicLocalSocksPort -TimeoutMs 600) {
             $script:ProxyType = "socks5"
             $script:ProxySpec = "127.0.0.1:$script:QuicLocalSocksPort"
+            $script:TunnelSshHost = "127.0.0.1"
             return
         }
         if ($proc.HasExited) {
@@ -764,6 +906,112 @@ function Ensure-QuicLocalProxy {
     }
 
     throw "failed to start local QUIC proxy client (sing-box)."
+}
+
+function Ensure-WssLocalProxy {
+    if ($script:ProxyType -ne "wss") {
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($script:QuicServer)) {
+        $script:QuicServer = $HostName
+    }
+    if ([string]::IsNullOrWhiteSpace($script:QuicSni)) {
+        $script:QuicSni = $script:QuicServer
+    }
+    if ($script:QuicPort -le 0) {
+        $script:QuicPort = 13131
+    }
+    if ([string]::IsNullOrWhiteSpace($script:QuicPassword)) {
+        throw "wss stability mode requires WSS password."
+    }
+
+    Ensure-SingBox
+
+    if (Test-TcpPort -Host "127.0.0.1" -Port $script:QuicLocalSocksPort -TimeoutMs 900) {
+        $nextPort = Get-AvailableLocalSocksPort -PreferredPort $script:QuicLocalSocksPort
+        Write-Host "local port $script:QuicLocalSocksPort is already in use; wss tunnel will use $nextPort."
+        $script:QuicLocalSocksPort = $nextPort
+    }
+
+    $tmpDir = Join-Path $env:TEMP "codex-remote"
+    $null = New-Item -ItemType Directory -Force -Path $tmpDir
+    $wssCfg = Join-Path $tmpDir "singbox-wss-client.json"
+
+    $cfg = @{
+        log = @{ level = "warn" }
+        inbounds = @(
+            @{
+                type = "socks"
+                listen = "127.0.0.1"
+                listen_port = $script:QuicLocalSocksPort
+            }
+        )
+        outbounds = @()
+        route = @{ final = "wss-out" }
+    }
+
+    $wssOutbound = @{
+        type = "trojan"
+        tag = "wss-out"
+        server = $script:QuicServer
+        server_port = $script:QuicPort
+        password = $script:QuicPassword
+        tls = @{
+            enabled = $true
+            server_name = $script:QuicSni
+            insecure = $true
+        }
+        transport = @{
+            type = "ws"
+            path = "/sticky-codex"
+        }
+    }
+
+    $wssUpstreamType = $script:QuicUpstreamType.ToLowerInvariant()
+    if ($wssUpstreamType -in @("socks5", "http")) {
+        if ([string]::IsNullOrWhiteSpace($script:QuicUpstreamSpec)) {
+            throw "wss upstream proxy is enabled but QUIC_UPSTREAM_SPEC is empty."
+        }
+
+        $upstream = Parse-ProxySpec -Spec $script:QuicUpstreamSpec
+        $upstreamOutbound = @{
+            type = if ($wssUpstreamType -eq "socks5") { "socks" } else { "http" }
+            tag = "wss-upstream"
+            server = $upstream.Host
+            server_port = [int]$upstream.Port
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($upstream.Username)) {
+            $upstreamOutbound.username = $upstream.Username
+            $upstreamOutbound.password = $upstream.Password
+        }
+
+        $cfg.outbounds += $upstreamOutbound
+        $wssOutbound.detour = "wss-upstream"
+    }
+
+    $cfg.outbounds += $wssOutbound
+
+    Set-Content -Path $wssCfg -Value ($cfg | ConvertTo-Json -Depth 12)
+
+    $proc = Start-Process -FilePath $script:SingBoxExe -ArgumentList @("run", "-c", $wssCfg) -WindowStyle Hidden -PassThru
+    $script:QuicRunner = $proc
+
+    for ($i = 0; $i -lt 15; $i++) {
+        Start-Sleep -Milliseconds 500
+        if (Test-TcpPort -Host "127.0.0.1" -Port $script:QuicLocalSocksPort -TimeoutMs 600) {
+            $script:ProxyType = "socks5"
+            $script:ProxySpec = "127.0.0.1:$script:QuicLocalSocksPort"
+            $script:TunnelSshHost = "127.0.0.1"
+            return
+        }
+        if ($proc.HasExited) {
+            break
+        }
+    }
+
+    throw "failed to start local wss stability tunnel client (sing-box)."
 }
 
 function Get-PuttyProxyArgs {
@@ -948,25 +1196,56 @@ function Initialize-ProfileIfMissing {
     $syncChoice = (Prompt-WithDefault -Prompt "sync local Codex auth.json before attach? (Y/n)" -Default "Y").ToLowerInvariant()
     $script:NoSyncAuth = ($syncChoice -in @("n", "no"))
 
-    while ($true) {
-        $proxyChoice = (Prompt-WithDefault -Prompt "Run through proxy? [no]  no/socks5/http/quic" -Default "no").ToLowerInvariant()
-        if ($proxyChoice -in @("no", "socks5", "http", "quic")) {
-            $script:ProxyType = $proxyChoice
-            break
-        }
-        Write-Host "please enter no, socks5, http, or quic."
+    $upstreamDefault = "no"
+    if ($script:ProxyType -in @("socks5", "http")) {
+        $upstreamDefault = $script:ProxyType
+    } elseif (($script:ProxyType -eq "quic" -or $script:ProxyType -eq "wss") -and $script:QuicUpstreamType -in @("no", "socks5", "http")) {
+        $upstreamDefault = $script:QuicUpstreamType
     }
 
-    if ($script:ProxyType -in @("socks5", "http")) {
-        $script:ProxySpec = Prompt-Required -Prompt "proxy address (host:port or host:port:username:password)" -Default $script:ProxySpec
-        $script:QuicUpstreamType = "no"
-        $script:QuicUpstreamSpec = ""
-    } elseif ($script:ProxyType -eq "quic") {
-        $script:QuicServer = Prompt-WithDefault -Prompt "quic server host" -Default $(if ([string]::IsNullOrWhiteSpace($script:QuicServer)) { $script:HostName } else { $script:QuicServer })
-        $script:QuicPort = [int](Prompt-WithDefault -Prompt "quic server port" -Default "$script:QuicPort")
-        $quicPrompt = "quic password (stored in profile)"
+    $upstreamType = "no"
+    while ($true) {
+        $upstreamChoice = (Prompt-WithDefault -Prompt "Use upstream proxy? [no]  no/socks5/http" -Default $upstreamDefault).ToLowerInvariant()
+        if ($upstreamChoice -in @("no", "socks5", "http")) {
+            $upstreamType = $upstreamChoice
+            break
+        }
+        Write-Host "please enter no, socks5, or http."
+    }
+
+    $upstreamSpec = ""
+    if ($upstreamType -in @("socks5", "http")) {
+        $upstreamSpecDefault = $script:ProxySpec
+        if ($script:ProxyType -eq "quic" -or $script:ProxyType -eq "wss") {
+            $upstreamSpecDefault = $script:QuicUpstreamSpec
+        }
+        $upstreamSpec = Prompt-Required -Prompt "upstream proxy address (host:port or host:port:username:password)" -Default $upstreamSpecDefault
+    }
+
+    $enableWss = $false
+    while ($true) {
+        $wssChoice = (Prompt-WithDefault -Prompt "Use wss stability layer? [n] y/n" -Default "n").ToLowerInvariant()
+        if ($wssChoice -in @("y", "yes")) {
+            $enableWss = $true
+            break
+        }
+        if ($wssChoice -in @("n", "no")) {
+            $enableWss = $false
+            break
+        }
+        Write-Host "please enter y or n."
+    }
+
+    if ($enableWss) {
+        $script:ProxyType = "wss"
+        $script:QuicServer = Prompt-WithDefault -Prompt "wss server host" -Default $(if ([string]::IsNullOrWhiteSpace($script:QuicServer)) { $script:HostName } else { $script:QuicServer })
+        if ($script:QuicPort -eq 61313) {
+            $script:QuicPort = 13131
+        }
+        $script:QuicPort = [int](Prompt-WithDefault -Prompt "wss server port" -Default "$script:QuicPort")
+        $quicPrompt = "wss password (stored in profile)"
         if (-not [string]::IsNullOrWhiteSpace($script:QuicPassword)) {
-            $quicPrompt = "quic password (stored in profile) [previous password]"
+            $quicPrompt = "wss password (stored in profile) [previous password]"
         }
         $secureQuic = Read-Host $quicPrompt -AsSecureString
         $qbstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureQuic)
@@ -978,24 +1257,21 @@ function Initialize-ProfileIfMissing {
         if (-not [string]::IsNullOrWhiteSpace($qp)) {
             $script:QuicPassword = $qp
         }
-        $script:QuicSni = Prompt-WithDefault -Prompt "quic tls sni (blank=server host)" -Default $(if ([string]::IsNullOrWhiteSpace($script:QuicSni)) { $script:QuicServer } else { $script:QuicSni })
-        $script:QuicLocalSocksPort = [int](Prompt-WithDefault -Prompt "local socks port for quic tunnel" -Default "$script:QuicLocalSocksPort")
-        while ($true) {
-            $upstreamChoice = (Prompt-WithDefault -Prompt "quic upstream proxy mode [no]  no/socks5/http" -Default $script:QuicUpstreamType).ToLowerInvariant()
-            if ($upstreamChoice -in @("no", "socks5", "http")) {
-                $script:QuicUpstreamType = $upstreamChoice
-                break
-            }
-            Write-Host "please enter no, socks5, or http."
+        $script:QuicSni = Prompt-WithDefault -Prompt "wss tls sni (blank=server host)" -Default $(if ([string]::IsNullOrWhiteSpace($script:QuicSni)) { $script:QuicServer } else { $script:QuicSni })
+        $wssLocalDefault = $script:QuicLocalSocksPort
+        if ($wssLocalDefault -eq 10809) {
+            $wssLocalDefault = 10819
         }
-        if ($script:QuicUpstreamType -in @("socks5", "http")) {
-            $script:QuicUpstreamSpec = Prompt-Required -Prompt "quic upstream proxy address (host:port or host:port:username:password)" -Default $script:QuicUpstreamSpec
-        } else {
-            $script:QuicUpstreamSpec = ""
-        }
+        $script:QuicLocalSocksPort = [int](Prompt-WithDefault -Prompt "local socks port for wss tunnel" -Default "$wssLocalDefault")
+        $script:QuicUpstreamType = $upstreamType
+        $script:QuicUpstreamSpec = $upstreamSpec
         $script:ProxySpec = ""
     } else {
-        $script:ProxySpec = ""
+        $script:ProxyType = $upstreamType
+        $script:ProxySpec = $upstreamSpec
+        $script:QuicServer = ""
+        $script:QuicPassword = ""
+        $script:QuicSni = ""
         $script:QuicUpstreamType = "no"
         $script:QuicUpstreamSpec = ""
     }
@@ -1146,7 +1422,7 @@ function Load-ProfileValues {
 
     if (-not $PSBoundParameters.ContainsKey("ProxyType")) {
         $profileProxyType = (Get-ProfileValue -Map $profileMap -Key "PROXY_TYPE" -Fallback "no").ToLowerInvariant()
-        if ($profileProxyType -in @("no", "socks5", "http", "quic")) {
+        if ($profileProxyType -in @("no", "socks5", "http", "quic", "wss")) {
             $script:ProxyType = $profileProxyType
         }
     }
@@ -1218,30 +1494,36 @@ function Ensure-RequiredConnectionValues {
         if ([string]::IsNullOrWhiteSpace($script:ProxyType)) {
             $script:ProxyType = "no"
         }
-        if ($script:ProxyType -notin @("no", "socks5", "http", "quic")) {
-            throw "invalid proxy type: $script:ProxyType (expected no|socks5|http|quic)"
+        if ($script:ProxyType -notin @("no", "socks5", "http", "quic", "wss")) {
+            throw "invalid proxy type: $script:ProxyType (expected no|socks5|http|quic|wss)"
         }
         if ($script:ProxyType -in @("socks5", "http") -and [string]::IsNullOrWhiteSpace($script:ProxySpec)) {
             throw "proxy is enabled but proxy spec is empty."
         }
-        if ($script:ProxyType -eq "quic") {
+        if ($script:ProxyType -eq "quic" -or $script:ProxyType -eq "wss") {
             if ([string]::IsNullOrWhiteSpace($script:QuicServer)) {
                 $script:QuicServer = $HostName
             }
+            if ($script:ProxyType -eq "wss" -and $script:QuicPort -eq 61313) {
+                $script:QuicPort = 13131
+            }
+            if ($script:ProxyType -eq "wss" -and $script:QuicLocalSocksPort -eq 10809) {
+                $script:QuicLocalSocksPort = 10819
+            }
             if ([string]::IsNullOrWhiteSpace($script:QuicPassword)) {
-                throw "proxy type 'quic' requires QUIC_PASSWORD_B64 (or -QuicPassword)."
+                throw "proxy type '$script:ProxyType' requires QUIC_PASSWORD_B64 (or -QuicPassword)."
             }
             if ($script:QuicPort -le 0 -or $script:QuicPort -gt 65535) {
-                throw "proxy type 'quic' requires a valid QUIC_PORT."
+                throw "proxy type '$script:ProxyType' requires a valid QUIC_PORT."
             }
             if ($script:QuicLocalSocksPort -le 0 -or $script:QuicLocalSocksPort -gt 65535) {
-                throw "proxy type 'quic' requires a valid QUIC_LOCAL_SOCKS_PORT."
+                throw "proxy type '$script:ProxyType' requires a valid QUIC_LOCAL_SOCKS_PORT."
             }
             if ($script:QuicUpstreamType -notin @("no", "socks5", "http")) {
-                throw "proxy type 'quic' has invalid QUIC_UPSTREAM_TYPE: $script:QuicUpstreamType (expected no|socks5|http)."
+                throw "proxy type '$script:ProxyType' has invalid QUIC_UPSTREAM_TYPE: $script:QuicUpstreamType (expected no|socks5|http)."
             }
             if ($script:QuicUpstreamType -in @("socks5", "http") -and [string]::IsNullOrWhiteSpace($script:QuicUpstreamSpec)) {
-                throw "proxy type 'quic' with upstream mode '$script:QuicUpstreamType' requires QUIC_UPSTREAM_SPEC."
+                throw "proxy type '$script:ProxyType' with upstream mode '$script:QuicUpstreamType' requires QUIC_UPSTREAM_SPEC."
             }
         }
         return
@@ -1393,6 +1675,7 @@ function Ensure-PuttyHostKeyCached {
         return
     }
 
+    $targetHost = Get-SshTargetHost
     $batchArgs = @("-ssh", "-batch", "-P", "$Port", "-l", $UserName)
     if (-not [string]::IsNullOrWhiteSpace($IdentityFile)) {
         $batchArgs += @("-i", $IdentityFile)
@@ -1401,7 +1684,7 @@ function Ensure-PuttyHostKeyCached {
         $batchArgs += @("-pw", $Password)
     }
     $batchArgs += Get-PuttyProxyArgs
-    $batchArgs += @($HostName, "true")
+    $batchArgs += @($targetHost, "true")
 
     $batchOutput = ""
     $batchExit = 1
@@ -1436,10 +1719,10 @@ function Ensure-PuttyHostKeyCached {
     }
 
     if (-not [Environment]::UserInteractive) {
-        throw "PuTTY host key for $HostName is not cached. run one interactive plink connection first to trust this host key."
+        throw "PuTTY host key for $targetHost is not cached. run one interactive plink connection first to trust this host key."
     }
 
-    Write-Host "PuTTY host key for $HostName is not cached. confirming once interactively..."
+    Write-Host "PuTTY host key for $targetHost is not cached. confirming once interactively..."
     $interactiveArgs = @("-ssh", "-P", "$Port", "-l", $UserName)
     if (-not [string]::IsNullOrWhiteSpace($IdentityFile)) {
         $interactiveArgs += @("-i", $IdentityFile)
@@ -1448,7 +1731,7 @@ function Ensure-PuttyHostKeyCached {
         $interactiveArgs += @("-pw", $Password)
     }
     $interactiveArgs += Get-PuttyProxyArgs
-    $interactiveArgs += @($HostName, "exit")
+    $interactiveArgs += @($targetHost, "exit")
     & $script:PlinkExe @interactiveArgs
 }
 
@@ -1470,6 +1753,7 @@ function Invoke-RemoteSsh {
     )
 
     if ($script:SshBackend -eq "putty") {
+        $targetHost = Get-SshTargetHost
         $args = @("-ssh", "-P", "$Port", "-l", $UserName)
 
         if (-not [string]::IsNullOrWhiteSpace($IdentityFile)) {
@@ -1483,10 +1767,10 @@ function Invoke-RemoteSsh {
         $args += Get-PuttyProxyArgs
 
         if ($Interactive) {
-            $args += @("-t", $HostName, $RemoteCommand)
+            $args += @("-t", $targetHost, $RemoteCommand)
             & $script:PlinkExe @args
         } else {
-            $args += @("-batch", $HostName, $RemoteCommand)
+            $args += @("-batch", $targetHost, $RemoteCommand)
             & $script:PlinkExe @args
         }
 
@@ -1509,6 +1793,7 @@ function Invoke-RemoteScp {
     )
 
     if ($script:SshBackend -eq "putty") {
+        $targetHost = Get-SshTargetHost
         $args = @("-P", "$Port", "-l", $UserName)
 
         if (-not [string]::IsNullOrWhiteSpace($IdentityFile)) {
@@ -1521,7 +1806,7 @@ function Invoke-RemoteScp {
 
         $args += Get-PuttyProxyArgs
 
-        $args += @($LocalPath, "$HostName`:$RemotePath")
+        $args += @($LocalPath, "$targetHost`:$RemotePath")
         & $script:PscpExe @args
         return $LASTEXITCODE
     }
@@ -1628,9 +1913,10 @@ function Quote-ForBashSingle {
 }
 
 function Write-TempSshConfig {
+    $targetHost = Get-SshTargetHost
     $lines = @()
     $lines += "Host $HostAlias"
-    $lines += "    HostName $HostName"
+    $lines += "    HostName $targetHost"
     $lines += "    User $UserName"
     $lines += "    Port $Port"
     $lines += "    ServerAliveInterval 15"
@@ -1787,6 +2073,7 @@ Show-Banner
 Ensure-WindowsOpenSsh
 Ensure-Codex
 Select-SshBackend
+Ensure-WssLocalProxy
 Ensure-QuicLocalProxy
 Ensure-NcatForProxy
 Ensure-PuttyHostKeyCached

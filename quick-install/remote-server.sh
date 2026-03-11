@@ -37,7 +37,7 @@ prompt_with_default() {
   local answer=""
 
   if [ -n "$default_value" ]; then
-    read -r -p "$prompt_text [$default_value]: " answe
+    read -r -p "$prompt_text [$default_value]: " answer
     if [ -z "$answer" ]; then
       printf '%s\n' "$default_value"
       return
@@ -46,7 +46,7 @@ prompt_with_default() {
     return
   fi
 
-  read -r -p "$prompt_text: " answe
+  read -r -p "$prompt_text: " answer
   printf '%s\n' "$answer"
 }
 
@@ -155,8 +155,8 @@ install_sing_box_server() {
   printf '%s\n' "$install_path"
 }
 
-configure_quic_server_if_selected() {
-  local choice quic_port quic_password quic_sni upstream_mode upstream_spec
+configure_wss_server_if_selected() {
+  local choice wss_port wss_password wss_sni upstream_mode upstream_spec
   local config_dir cert_path key_path config_path service_path singbox_bin
   local outbound_block final_tag escaped_pass escaped_sni escaped_host escaped_user escaped_proxy_pass singbox_upstream_type
   local host_hint
@@ -165,7 +165,7 @@ configure_quic_server_if_selected() {
     return
   fi
 
-  choice="$(prompt_with_default "set up QUIC proxy server now? (y/N)" "N")"
+  choice="$(prompt_with_default "set up WSS stability proxy server now? (y/N)" "N")"
   case "$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]')" in
     y|yes)
       ;;
@@ -174,24 +174,24 @@ configure_quic_server_if_selected() {
       ;;
   esac
 
-  quic_port="$(prompt_with_default "quic listen port" "61313")"
-  case "$quic_port" in
+  wss_port="$(prompt_with_default "wss listen port" "13131")"
+  case "$wss_port" in
     ''|*[!0-9]*)
-      echo "quic listen port must be numeric (1-65535)." >&2
+      echo "wss listen port must be numeric (1-65535)." >&2
       exit 1
       ;;
   esac
-  if [ "$quic_port" -lt 1 ] || [ "$quic_port" -gt 65535 ]; then
-    echo "quic listen port must be in range 1-65535." >&2
+  if [ "$wss_port" -lt 1 ] || [ "$wss_port" -gt 65535 ]; then
+    echo "wss listen port must be in range 1-65535." >&2
     exit 1
   fi
-  read -r -s -p "quic password (for clients): " quic_password
+  read -r -s -p "wss password (for clients): " wss_password
   printf '\n'
-  if [ -z "$quic_password" ]; then
-    echo "quic password is required." >&2
+  if [ -z "$wss_password" ]; then
+    echo "wss password is required." >&2
     exit 1
   fi
-  quic_sni="$(prompt_with_default "tls sni/common-name for certificate" "sticky-codex.local")"
+  wss_sni="$(prompt_with_default "tls sni/common-name for certificate" "sticky-codex.local")"
 
   while true; do
     upstream_mode="$(prompt_with_default "upstream proxy mode [no]  no/socks5/http" "no")"
@@ -212,11 +212,11 @@ configure_quic_server_if_selected() {
   fi
 
   singbox_bin="$(install_sing_box_server)"
-  config_dir="/etc/sticky-codex/quic"
+  config_dir="/etc/sticky-codex/wss"
   cert_path="$config_dir/server.crt"
   key_path="$config_dir/server.key"
   config_path="$config_dir/sing-box-server.json"
-  service_path="/etc/systemd/system/sticky-codex-quic.service"
+  service_path="/etc/systemd/system/sticky-codex-wss.service"
 
   sudo mkdir -p "$config_dir"
 
@@ -238,17 +238,17 @@ configure_quic_server_if_selected() {
     fi
   fi
   if ! has_command openssl; then
-    echo "openssl is required for QUIC certificate generation." >&2
+    echo "openssl is required for WSS certificate generation." >&2
     exit 1
   fi
 
   sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-    -subj "/CN=$quic_sni" \
+    -subj "/CN=$wss_sni" \
     -keyout "$key_path" \
     -out "$cert_path" >/dev/null 2>&1
 
-  escaped_sni="$(json_escape "$quic_sni")"
-  escaped_pass="$(json_escape "$quic_password")"
+  escaped_sni="$(json_escape "$wss_sni")"
+  escaped_pass="$(json_escape "$wss_password")"
   outbound_block='{"type":"direct","tag":"direct"}'
   final_tag="direct"
   if [ "$upstream_mode" = "socks5" ] || [ "$upstream_mode" = "http" ]; then
@@ -273,16 +273,20 @@ configure_quic_server_if_selected() {
   "log": { "level": "warn" },
   "inbounds": [
     {
-      "type": "hysteria2",
-      "tag": "hy2-in",
+      "type": "trojan",
+      "tag": "wss-in",
       "listen": "::",
-      "listen_port": $quic_port,
-      "users": [ { "password": "$escaped_pass" } ],
+      "listen_port": $wss_port,
+      "users": [ { "name": "sticky-codex", "password": "$escaped_pass" } ],
       "tls": {
         "enabled": true,
         "server_name": "$escaped_sni",
         "certificate_path": "$cert_path",
         "key_path": "$key_path"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/sticky-codex"
       }
     }
   ],
@@ -295,7 +299,7 @@ EOF
 
   sudo tee "$service_path" >/dev/null <<EOF
 [Unit]
-Description=Sticky Codex QUIC Proxy (sing-box)
+Description=Sticky Codex WSS Stability Proxy (sing-box)
 After=network-online.target
 Wants=network-online.target
 
@@ -311,7 +315,7 @@ WantedBy=multi-user.target
 EOF
 
   sudo systemctl daemon-reload
-  sudo systemctl enable --now sticky-codex-quic.service
+  sudo systemctl enable --now sticky-codex-wss.service
 
   host_hint="$(hostname -I 2>/dev/null | awk '{print $1}')"
   if [ -z "$host_hint" ]; then
@@ -319,13 +323,14 @@ EOF
   fi
 
   echo
-  echo "QUIC proxy server is configured and running (service: sticky-codex-quic)."
+  echo "WSS stability proxy server is configured and running (service: sticky-codex-wss)."
   echo "client values:"
-  echo "  proxy type: quic"
-  echo "  quic server host: $host_hint"
-  echo "  quic server port: $quic_port"
-  echo "  quic password: (the value you entered)"
-  echo "  quic tls sni: $quic_sni"
+  echo "  proxy type: wss"
+  echo "  wss server host: $host_hint"
+  echo "  wss server port: $wss_port"
+  echo "  wss password: (the value you entered)"
+  echo "  wss tls sni: $wss_sni"
+  echo "  wss path: /sticky-codex"
   if [ "$upstream_mode" != "no" ]; then
     echo "  upstream mode: $upstream_mode"
     echo "  upstream target: $UPSTREAM_HOST:$UPSTREAM_PORT"
@@ -459,5 +464,5 @@ choose_install_target "$@"
 download_launcher
 install_launcher
 printf 'installed %s\n' "$TARGET"
-configure_quic_server_if_selected
+configure_wss_server_if_selected
 prompt_install_codex_if_missing

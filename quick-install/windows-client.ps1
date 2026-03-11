@@ -376,35 +376,75 @@ if ($authMode -eq "password") {
         }
     }
 
-    while ($true) {
-        $proxyType = (Prompt-WithDefault -Prompt "Run through proxy? [no]  no/socks5/http/quic" -Default (Get-ProfileValue -Map $profileMap -Key "PROXY_TYPE" -Fallback "no")).ToLowerInvariant()
-        if ($proxyType -in @("no", "socks5", "http", "quic")) {
-            break
+    $proxyTypeFromProfile = (Get-ProfileValue -Map $profileMap -Key "PROXY_TYPE" -Fallback "no").ToLowerInvariant()
+    $upstreamDefault = "no"
+    if ($proxyTypeFromProfile -in @("socks5", "http")) {
+        $upstreamDefault = $proxyTypeFromProfile
+    } elseif ($proxyTypeFromProfile -in @("quic", "wss")) {
+        $upstreamDefault = (Get-ProfileValue -Map $profileMap -Key "QUIC_UPSTREAM_TYPE" -Fallback "no").ToLowerInvariant()
+        if ($upstreamDefault -notin @("no", "socks5", "http")) {
+            $upstreamDefault = "no"
         }
-        Write-Host "please enter no, socks5, http, or quic."
     }
 
+    $upstreamType = "no"
+    while ($true) {
+        $upstreamType = (Prompt-WithDefault -Prompt "Use upstream proxy? [no]  no/socks5/http" -Default $upstreamDefault).ToLowerInvariant()
+        if ($upstreamType -in @("no", "socks5", "http")) {
+            break
+        }
+        Write-Host "please enter no, socks5, or http."
+    }
+
+    $upstreamSpec = ""
+    if ($upstreamType -in @("socks5", "http")) {
+        $upstreamSpecDefault = Get-ProfileValue -Map $profileMap -Key "PROXY_SPEC"
+        if ($proxyTypeFromProfile -in @("quic", "wss")) {
+            $upstreamSpecDefault = Get-ProfileValue -Map $profileMap -Key "QUIC_UPSTREAM_SPEC"
+        }
+        $upstreamSpec = Prompt-Required -Prompt "upstream proxy address (host:port or host:port:username:password)" -Default $upstreamSpecDefault
+    }
+
+    $useWss = $false
+    while ($true) {
+        $wssChoice = (Prompt-WithDefault -Prompt "Use wss stability layer? [n] y/n" -Default "n").ToLowerInvariant()
+        if ($wssChoice -in @("y", "yes")) {
+            $useWss = $true
+            break
+        }
+        if ($wssChoice -in @("n", "no")) {
+            $useWss = $false
+            break
+        }
+        Write-Host "please enter y or n."
+    }
+
+    $proxyType = if ($useWss) { "wss" } else { $upstreamType }
     $proxySpec = ""
     $quicServer = ""
-    $quicPort = "61313"
+    $quicPort = "13131"
     $quicPassword = ""
     $quicSni = ""
     $quicLocalSocksPort = "10809"
     $quicUpstreamType = "no"
     $quicUpstreamSpec = ""
     if ($proxyType -in @("socks5", "http")) {
-        $proxySpec = Prompt-Required -Prompt "proxy address (host:port or host:port:username:password)" -Default (Get-ProfileValue -Map $profileMap -Key "PROXY_SPEC")
-    } elseif ($proxyType -eq "quic") {
-        $quicServer = Prompt-WithDefault -Prompt "quic server host" -Default (Get-ProfileValue -Map $profileMap -Key "QUIC_SERVER" -Fallback $hostName)
-        $quicPort = Prompt-WithDefault -Prompt "quic server port" -Default (Get-ProfileValue -Map $profileMap -Key "QUIC_PORT" -Fallback "61313")
+        $proxySpec = $upstreamSpec
+    } elseif ($proxyType -eq "wss") {
+        $quicServer = Prompt-WithDefault -Prompt "wss server host" -Default (Get-ProfileValue -Map $profileMap -Key "QUIC_SERVER" -Fallback $hostName)
+        $quicPortDefault = Get-ProfileValue -Map $profileMap -Key "QUIC_PORT" -Fallback "13131"
+        if ($quicPortDefault -eq "61313") {
+            $quicPortDefault = "13131"
+        }
+        $quicPort = Prompt-WithDefault -Prompt "wss server port" -Default $quicPortDefault
         $existingQuicPassword = Decode-Base64 (Get-ProfileValue -Map $profileMap -Key "QUIC_PASSWORD_B64")
         if ([string]::IsNullOrWhiteSpace($existingQuicPassword)) {
             $existingQuicPassword = Get-ProfileValue -Map $profileMap -Key "QUIC_PASSWORD"
         }
         if ([string]::IsNullOrWhiteSpace($existingQuicPassword)) {
-            $secureQuic = Read-Host "quic password (stored in profile)" -AsSecureString
+            $secureQuic = Read-Host "wss password (stored in profile)" -AsSecureString
         } else {
-            $secureQuic = Read-Host "quic password (stored in profile) [previous password]" -AsSecureString
+            $secureQuic = Read-Host "wss password (stored in profile) [previous password]" -AsSecureString
         }
         $qbstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureQuic)
         try {
@@ -415,19 +455,14 @@ if ($authMode -eq "password") {
         if ([string]::IsNullOrWhiteSpace($quicPassword)) {
             $quicPassword = $existingQuicPassword
         }
-        $quicSni = Prompt-WithDefault -Prompt "quic tls sni (blank=server host)" -Default (Get-ProfileValue -Map $profileMap -Key "QUIC_SNI" -Fallback $quicServer)
-        $quicLocalSocksPort = Prompt-WithDefault -Prompt "local socks port for quic tunnel" -Default (Get-ProfileValue -Map $profileMap -Key "QUIC_LOCAL_SOCKS_PORT" -Fallback "10809")
-
-        while ($true) {
-            $quicUpstreamType = (Prompt-WithDefault -Prompt "quic upstream proxy mode [no]  no/socks5/http" -Default (Get-ProfileValue -Map $profileMap -Key "QUIC_UPSTREAM_TYPE" -Fallback "no")).ToLowerInvariant()
-            if ($quicUpstreamType -in @("no", "socks5", "http")) {
-                break
-            }
-            Write-Host "please enter no, socks5, or http."
+        $quicSni = Prompt-WithDefault -Prompt "wss tls sni (blank=server host)" -Default (Get-ProfileValue -Map $profileMap -Key "QUIC_SNI" -Fallback $quicServer)
+        $quicLocalDefault = Get-ProfileValue -Map $profileMap -Key "QUIC_LOCAL_SOCKS_PORT" -Fallback "10809"
+        if ($quicLocalDefault -eq "10809") {
+            $quicLocalDefault = "10819"
         }
-        if ($quicUpstreamType -in @("socks5", "http")) {
-            $quicUpstreamSpec = Prompt-Required -Prompt "quic upstream proxy address (host:port or host:port:username:password)" -Default (Get-ProfileValue -Map $profileMap -Key "QUIC_UPSTREAM_SPEC")
-        }
+        $quicLocalSocksPort = Prompt-WithDefault -Prompt "local socks port for wss tunnel" -Default $quicLocalDefault
+        $quicUpstreamType = $upstreamType
+        $quicUpstreamSpec = $upstreamSpec
     }
 
     $profileValues = @{
