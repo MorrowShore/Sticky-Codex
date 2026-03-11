@@ -2135,37 +2135,19 @@ function Invoke-RemoteScp {
         $args += Get-PuttyProxyArgs
         $args += Get-PuttyHostKeyArgs
 
-        $oldNativePreference = $null
-        $hasNativePreference = $false
-        if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue) {
-            $hasNativePreference = $true
-            $oldNativePreference = $global:PSNativeCommandUseErrorActionPreference
-            $global:PSNativeCommandUseErrorActionPreference = $false
-        }
-        try {
-            $args += @($LocalPath, "$targetHost`:$RemotePath")
-            & $script:PscpExe @args
-            return $LASTEXITCODE
-        } catch {
-            $nativeExit = 0
-            try {
-                $nativeExit = [int]$LASTEXITCODE
-            } catch {
-                $nativeExit = 0
-            }
-            if ($nativeExit -gt 0) {
-                return $nativeExit
-            }
-            return 1
-        } finally {
-            if ($hasNativePreference) {
-                $global:PSNativeCommandUseErrorActionPreference = $oldNativePreference
-            }
+        $args += @($LocalPath, "$targetHost`:$RemotePath")
+        $native = Invoke-NativeCapture -FilePath $script:PscpExe -Arguments $args
+        return @{
+            ExitCode = [int]$native.ExitCode
+            Output = [string]$native.Output
         }
     }
 
-    & scp -F $script:SshConfigPath $LocalPath "$HostAlias`:$RemotePath"
-    return $LASTEXITCODE
+    $output = (& scp -F $script:SshConfigPath $LocalPath "$HostAlias`:$RemotePath" 2>&1 | Out-String)
+    return @{
+        ExitCode = [int]$LASTEXITCODE
+        Output = [string]$output
+    }
 }
 
 function Install-RemoteCodexCli {
@@ -2324,6 +2306,30 @@ fi
     return ($exitCode -eq 0)
 }
 
+function Resolve-RemoteHomePath {
+    $cmd = "bash -lc " + (Quote-ForBashSingle 'printf %s "$HOME"')
+    $result = Invoke-RemoteSshCapture -RemoteCommand $cmd
+    if ($result.ExitCode -eq 0) {
+        $text = [string]$result.Output
+        if (-not [string]::IsNullOrWhiteSpace($text)) {
+            foreach ($line in ($text -split "(`r`n|`n|`r)")) {
+                $trimmed = $line.Trim()
+                if ($trimmed.StartsWith("/")) {
+                    return $trimmed
+                }
+            }
+        }
+    }
+
+    if ($UserName -eq "root") {
+        return "/root"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($UserName)) {
+        return "/home/$UserName"
+    }
+    return "/root"
+}
+
 function Sync-LocalCodexAuthToRemote {
     $localAuth = Get-LocalCodexAuthPath
 
@@ -2340,20 +2346,60 @@ do this on Windows first:
 "@
     }
 
-    Write-Host "syncing local Codex auth to VPS..."
-    $prepareResult = Invoke-RemoteSshCapture -RemoteCommand "mkdir -p ~/.codex && chmod 700 ~/.codex"
-    if ($prepareResult.ExitCode -ne 0) {
-        $tail = Get-TextTail -Text ([string]$prepareResult.Output) -MaxLines 10
-        if ([string]::IsNullOrWhiteSpace($tail)) {
-            throw "failed to prepare ~/.codex on the remote host."
+    Write-Host "syncing local Codex auth to VPS over active SSH transport..."
+    $remoteHome = Resolve-RemoteHomePath
+    $remoteCodexDir = ($remoteHome.TrimEnd("/") + "/.codex")
+    $remoteAuthPath = ($remoteCodexDir + "/auth.json")
+    $remoteCodexDirArg = Quote-ForBashSingle $remoteCodexDir
+    $remoteAuthArg = Quote-ForBashSingle $remoteAuthPath
+
+    $prepareCmd = "bash -lc " + (Quote-ForBashSingle "mkdir -p $remoteCodexDirArg && chmod 700 $remoteCodexDirArg")
+    $verifyCmd = "bash -lc " + (Quote-ForBashSingle "if [ -s $remoteAuthArg ]; then chmod 600 $remoteAuthArg || true; exit 0; fi; exit 32")
+
+    $maxAttempts = 8
+    $lastDetail = ""
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $prepareResult = Invoke-RemoteSshCapture -RemoteCommand $prepareCmd
+        if ($prepareResult.ExitCode -ne 0) {
+            $lastDetail = Get-TextTail -Text ([string]$prepareResult.Output) -MaxLines 10
+            if ($attempt -lt $maxAttempts) {
+                $delay = [Math]::Min(15, [Math]::Max(1, $attempt * 2))
+                Write-Host "auth sync prepare failed (attempt $attempt/$maxAttempts). retrying in $delay seconds..."
+                Start-Sleep -Seconds $delay
+                continue
+            }
+            break
         }
-        throw "failed to prepare ~/.codex on the remote host. details: $tail"
+
+        $copyResult = Invoke-RemoteScp -LocalPath $localAuth -RemotePath $remoteAuthPath
+        if ($copyResult.ExitCode -ne 0) {
+            $lastDetail = Get-TextTail -Text ([string]$copyResult.Output) -MaxLines 10
+            if ($attempt -lt $maxAttempts) {
+                $delay = [Math]::Min(15, [Math]::Max(1, $attempt * 2))
+                Write-Host "auth sync copy failed (attempt $attempt/$maxAttempts). retrying in $delay seconds..."
+                Start-Sleep -Seconds $delay
+                continue
+            }
+            break
+        }
+
+        $verifyResult = Invoke-RemoteSshCapture -RemoteCommand $verifyCmd
+        if ($verifyResult.ExitCode -eq 0) {
+            return
+        }
+        $lastDetail = Get-TextTail -Text ([string]$verifyResult.Output) -MaxLines 10
+        if ($attempt -lt $maxAttempts) {
+            $delay = [Math]::Min(15, [Math]::Max(1, $attempt * 2))
+            Write-Host "auth sync verify failed (attempt $attempt/$maxAttempts). retrying in $delay seconds..."
+            Start-Sleep -Seconds $delay
+            continue
+        }
     }
 
-    $copyExit = Invoke-RemoteScp -LocalPath $localAuth -RemotePath "~/.codex/auth.json"
-    if ($copyExit -ne 0) {
+    if ([string]::IsNullOrWhiteSpace($lastDetail)) {
         throw "failed to copy auth.json to the remote host."
     }
+    throw "failed to copy auth.json to the remote host. details: $lastDetail"
 }
 
 function Quote-ForBashSingle {
