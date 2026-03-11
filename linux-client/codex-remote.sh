@@ -1891,7 +1891,7 @@ test_remote_prereqs() {
     esac
   fi
 
-  if [ "$exit_code" -eq 255 ] || printf '%s' "$output_lower" | grep -Eq "connection refused|network error|timed out|timeout|name or service not known|could not resolve|no route to host|connection reset|connection closed"; then
+  if [ "$exit_code" -eq 255 ] || printf '%s' "$output_lower" | grep -Eq "connection refused|network error|timed out|timeout|name or service not known|could not resolve|no route to host|connection reset|connection closed|unexpectedly closed network connection|remote side unexpectedly closed"; then
     if [ -n "$preflight_output" ]; then
       echo "remote preflight failed due to SSH transport/connectivity issue (exit $exit_code): $preflight_output" >&2
     else

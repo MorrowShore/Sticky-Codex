@@ -376,20 +376,23 @@ if ($authMode -eq "password") {
         }
     }
 
+    $hasExistingProfile = Test-Path $ProfileFile
     $proxyTypeFromProfile = (Get-ProfileValue -Map $profileMap -Key "PROXY_TYPE" -Fallback "no").ToLowerInvariant()
     $upstreamDefault = "no"
-    if ($proxyTypeFromProfile -in @("socks5", "http")) {
-        $upstreamDefault = $proxyTypeFromProfile
-    } elseif ($proxyTypeFromProfile -in @("quic", "wss")) {
-        $upstreamDefault = (Get-ProfileValue -Map $profileMap -Key "QUIC_UPSTREAM_TYPE" -Fallback "no").ToLowerInvariant()
-        if ($upstreamDefault -notin @("no", "socks5", "http")) {
-            $upstreamDefault = "no"
+    if ($hasExistingProfile) {
+        if ($proxyTypeFromProfile -in @("socks5", "http")) {
+            $upstreamDefault = $proxyTypeFromProfile
+        } elseif ($proxyTypeFromProfile -in @("quic", "wss")) {
+            $upstreamDefault = (Get-ProfileValue -Map $profileMap -Key "QUIC_UPSTREAM_TYPE" -Fallback "no").ToLowerInvariant()
+            if ($upstreamDefault -notin @("no", "socks5", "http")) {
+                $upstreamDefault = "no"
+            }
         }
     }
 
     $upstreamType = "no"
     while ($true) {
-        $upstreamType = (Prompt-WithDefault -Prompt "Use upstream proxy? [no]  no/socks5/http" -Default $upstreamDefault).ToLowerInvariant()
+        $upstreamType = (Prompt-WithDefault -Prompt "Use upstream proxy? no/socks5/http" -Default $upstreamDefault).ToLowerInvariant()
         if ($upstreamType -in @("no", "socks5", "http")) {
             break
         }
@@ -405,7 +408,7 @@ if ($authMode -eq "password") {
         $upstreamSpec = Prompt-Required -Prompt "upstream proxy address (host:port or host:port:username:password)" -Default $upstreamSpecDefault
     }
 
-    $wssDefault = if ($proxyTypeFromProfile -in @("quic", "wss")) { "y" } else { "n" }
+    $wssDefault = if (-not $hasExistingProfile -or $proxyTypeFromProfile -in @("quic", "wss")) { "y" } else { "n" }
     $useWss = $false
     while ($true) {
         $wssChoice = (Prompt-WithDefault -Prompt "Use wss stability layer? y/n" -Default $wssDefault).ToLowerInvariant()

@@ -1204,7 +1204,7 @@ function Initialize-ProfileIfMissing {
 
     $upstreamType = "no"
     while ($true) {
-        $upstreamChoice = (Prompt-WithDefault -Prompt "Use upstream proxy? [no]  no/socks5/http" -Default $upstreamDefault).ToLowerInvariant()
+        $upstreamChoice = (Prompt-WithDefault -Prompt "Use upstream proxy? no/socks5/http" -Default $upstreamDefault).ToLowerInvariant()
         if ($upstreamChoice -in @("no", "socks5", "http")) {
             $upstreamType = $upstreamChoice
             break
@@ -1223,7 +1223,7 @@ function Initialize-ProfileIfMissing {
 
     $enableWss = $false
     while ($true) {
-        $wssChoice = (Prompt-WithDefault -Prompt "Use wss stability layer? [n] y/n" -Default "n").ToLowerInvariant()
+        $wssChoice = (Prompt-WithDefault -Prompt "Use wss stability layer? y/n" -Default "y").ToLowerInvariant()
         if ($wssChoice -in @("y", "yes")) {
             $enableWss = $true
             break
@@ -1769,15 +1769,38 @@ function Invoke-RemoteSsh {
 
         $args += Get-PuttyProxyArgs
 
-        if ($Interactive) {
-            $args += @("-t", $targetHost, $RemoteCommand)
-            & $script:PlinkExe @args
-        } else {
-            $args += @("-batch", $targetHost, $RemoteCommand)
-            & $script:PlinkExe @args
+        $oldNativePreference = $null
+        $hasNativePreference = $false
+        if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue) {
+            $hasNativePreference = $true
+            $oldNativePreference = $global:PSNativeCommandUseErrorActionPreference
+            $global:PSNativeCommandUseErrorActionPreference = $false
         }
-
-        return $LASTEXITCODE
+        try {
+            if ($Interactive) {
+                $args += @("-t", $targetHost, $RemoteCommand)
+                & $script:PlinkExe @args
+            } else {
+                $args += @("-batch", $targetHost, $RemoteCommand)
+                & $script:PlinkExe @args
+            }
+            return $LASTEXITCODE
+        } catch {
+            $nativeExit = 0
+            try {
+                $nativeExit = [int]$LASTEXITCODE
+            } catch {
+                $nativeExit = 0
+            }
+            if ($nativeExit -gt 0) {
+                return $nativeExit
+            }
+            return 1
+        } finally {
+            if ($hasNativePreference) {
+                $global:PSNativeCommandUseErrorActionPreference = $oldNativePreference
+            }
+        }
     }
 
     $args = @("-F", $script:SshConfigPath)
@@ -1839,6 +1862,29 @@ function Invoke-RemoteSshCapture {
             $output = (& ssh @args 2>&1 | Out-String)
             $exitCode = $LASTEXITCODE
         }
+    } catch {
+        $caughtText = ""
+        if ($_.Exception -and -not [string]::IsNullOrWhiteSpace($_.Exception.Message)) {
+            $caughtText = $_.Exception.Message
+        } else {
+            $caughtText = ($_ | Out-String).Trim()
+        }
+        if ([string]::IsNullOrWhiteSpace($output)) {
+            $output = $caughtText
+        } else {
+            $output = ($output + [Environment]::NewLine + $caughtText).Trim()
+        }
+        $nativeExit = 0
+        try {
+            $nativeExit = [int]$LASTEXITCODE
+        } catch {
+            $nativeExit = 0
+        }
+        if ($nativeExit -gt 0) {
+            $exitCode = $nativeExit
+        } else {
+            $exitCode = 1
+        }
     } finally {
         if ($hasNativePreference) {
             $global:PSNativeCommandUseErrorActionPreference = $oldNativePreference
@@ -1871,9 +1917,33 @@ function Invoke-RemoteScp {
 
         $args += Get-PuttyProxyArgs
 
-        $args += @($LocalPath, "$targetHost`:$RemotePath")
-        & $script:PscpExe @args
-        return $LASTEXITCODE
+        $oldNativePreference = $null
+        $hasNativePreference = $false
+        if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue) {
+            $hasNativePreference = $true
+            $oldNativePreference = $global:PSNativeCommandUseErrorActionPreference
+            $global:PSNativeCommandUseErrorActionPreference = $false
+        }
+        try {
+            $args += @($LocalPath, "$targetHost`:$RemotePath")
+            & $script:PscpExe @args
+            return $LASTEXITCODE
+        } catch {
+            $nativeExit = 0
+            try {
+                $nativeExit = [int]$LASTEXITCODE
+            } catch {
+                $nativeExit = 0
+            }
+            if ($nativeExit -gt 0) {
+                return $nativeExit
+            }
+            return 1
+        } finally {
+            if ($hasNativePreference) {
+                $global:PSNativeCommandUseErrorActionPreference = $oldNativePreference
+            }
+        }
     }
 
     & scp -F $script:SshConfigPath $LocalPath "$HostAlias`:$RemotePath"
@@ -2159,7 +2229,7 @@ fi
         }
     }
 
-    if ($exitCode -eq 255 -or $outputLower -match "connection refused|network error|timed out|timeout|name or service not known|could not resolve|no route to host|connection reset|connection closed") {
+    if ($exitCode -eq 255 -or $outputLower -match "connection refused|network error|timed out|timeout|name or service not known|could not resolve|no route to host|connection reset|connection closed|unexpectedly closed network connection|remote side unexpectedly closed") {
         $tail = Get-TextTail -Text $output -MaxLines 10
         if ([string]::IsNullOrWhiteSpace($tail)) {
             throw "remote preflight failed due to SSH transport/connectivity issue (exit $exitCode)."

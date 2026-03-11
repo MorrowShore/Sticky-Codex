@@ -166,7 +166,7 @@ configure_wss_server_if_selected() {
     return
   fi
 
-  choice="$(prompt_with_default "set up WSS stability proxy server now? (y/N)" "N")"
+  choice="$(prompt_with_default "set up WSS stability proxy server now? (Y/n)" "Y")"
   case "$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]')" in
     y|yes)
       ;;
@@ -198,10 +198,13 @@ configure_wss_server_if_selected() {
     exit 1
   fi
   if [ -n "$previous_wss_password" ]; then
-    wss_password="$previous_wss_password"
-    echo "reusing previously configured WSS password from $config_path."
+    read -r -s -p "wss password (stored in profile) [previous password]: " wss_password
+    printf '\n'
+    if [ -z "$wss_password" ]; then
+      wss_password="$previous_wss_password"
+    fi
   else
-    read -r -s -p "wss password (for clients): " wss_password
+    read -r -s -p "wss password (stored in profile): " wss_password
     printf '\n'
   fi
   if [ -z "$wss_password" ]; then
