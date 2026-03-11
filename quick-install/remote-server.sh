@@ -159,6 +159,7 @@ configure_wss_server_if_selected() {
   local choice wss_port wss_password wss_sni upstream_mode upstream_spec
   local previous_wss_password
   local config_dir cert_path key_path config_path service_path singbox_bin
+  local cert_tmp key_tmp
   local outbound_block final_tag escaped_pass escaped_sni escaped_host escaped_user escaped_proxy_pass singbox_upstream_type
   local host_hint
 
@@ -256,10 +257,19 @@ configure_wss_server_if_selected() {
     exit 1
   fi
 
-  sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+  cert_tmp="$(mktemp)"
+  key_tmp="$(mktemp)"
+  if ! openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
     -subj "/CN=$wss_sni" \
-    -keyout "$key_path" \
-    -out "$cert_path" >/dev/null 2>&1
+    -keyout "$key_tmp" \
+    -out "$cert_tmp" >/dev/null 2>&1; then
+    rm -f "$cert_tmp" "$key_tmp"
+    echo "failed to generate WSS certificate/key pair with openssl." >&2
+    exit 1
+  fi
+  sudo install -m 600 "$key_tmp" "$key_path"
+  sudo install -m 644 "$cert_tmp" "$cert_path"
+  rm -f "$cert_tmp" "$key_tmp"
 
   escaped_sni="$(json_escape "$wss_sni")"
   escaped_pass="$(json_escape "$wss_password")"
@@ -328,8 +338,24 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
+  if ! "$singbox_bin" check -c "$config_path" >/dev/null 2>&1; then
+    echo "generated WSS sing-box config failed validation:" >&2
+    "$singbox_bin" check -c "$config_path" >&2 || true
+    exit 1
+  fi
+
   sudo systemctl daemon-reload
-  sudo systemctl enable --now sticky-codex-wss.service
+  sudo systemctl enable sticky-codex-wss.service >/dev/null 2>&1 || true
+  if ! sudo systemctl restart sticky-codex-wss.service; then
+    echo "failed to restart sticky-codex-wss.service." >&2
+    sudo journalctl -u sticky-codex-wss.service --no-pager -n 80 >&2 || true
+    exit 1
+  fi
+  if ! sudo systemctl is-active --quiet sticky-codex-wss.service; then
+    echo "sticky-codex-wss.service is not active after restart." >&2
+    sudo systemctl status sticky-codex-wss.service --no-pager -n 80 >&2 || true
+    exit 1
+  fi
 
   host_hint="$(hostname -I 2>/dev/null | awk '{print $1}')"
   if [ -z "$host_hint" ]; then

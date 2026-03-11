@@ -1868,7 +1868,7 @@ test_remote_prereqs() {
   cmd="bash -lc $(quote_for_bash_single "$check_cmd")"
 
   preflight_output="$(run_ssh -F "$SSH_CONFIG_PATH" "$HOST_ALIAS" "$cmd" 2>&1)" && {
-    return
+    return 0
   }
   exit_code="$?"
   output_lower="$(printf '%s' "$preflight_output" | tr '[:upper:]' '[:lower:]')"
@@ -1892,12 +1892,15 @@ test_remote_prereqs() {
   fi
 
   if [ "$exit_code" -eq 255 ] || printf '%s' "$output_lower" | grep -Eq "connection refused|network error|timed out|timeout|name or service not known|could not resolve|no route to host|connection reset|connection closed|unexpectedly closed network connection|remote side unexpectedly closed"; then
+    if [ "$PROXY_TYPE" = "wss" ]; then
+      echo "wss hint: on the server, run 'sudo systemctl restart sticky-codex-wss.service' and inspect 'journalctl -u sticky-codex-wss.service --no-pager -n 80'." >&2
+    fi
     if [ -n "$preflight_output" ]; then
       echo "remote preflight failed due to SSH transport/connectivity issue (exit $exit_code): $preflight_output" >&2
     else
       echo "remote preflight failed due to SSH transport/connectivity issue (exit $exit_code)." >&2
     fi
-    exit 1
+    return 1
   fi
 
   if [ "$exit_code" -ge 20 ] && [ "$exit_code" -le 29 ]; then
@@ -1910,7 +1913,7 @@ test_remote_prereqs() {
   else
     echo "remote preflight could not complete (exit $exit_code)." >&2
   fi
-  exit 1
+  return 1
 }
 
 cleanup_local_helpers() {
@@ -1943,10 +1946,16 @@ start_quic_local_proxy_if_configured
 ensure_ncat_if_proxy_configured
 
 write_temp_ssh_config
-test_remote_prereqs
 
-if [ "$SYNC_AUTH" = "1" ]; then
+preflight_ready=1
+if ! test_remote_prereqs; then
+  preflight_ready=0
+fi
+
+if [ "$SYNC_AUTH" = "1" ] && [ "$preflight_ready" = "1" ]; then
   sync_local_codex_auth_to_remote
+elif [ "$SYNC_AUTH" = "1" ]; then
+  echo "skipping local auth sync until remote connectivity stabilizes."
 fi
 
 start_reconnect_loop

@@ -2204,7 +2204,7 @@ fi
     $result = Invoke-RemoteSshCapture -RemoteCommand $cmd
     $exitCode = $result.ExitCode
     if ($exitCode -eq 0) {
-        return
+        return $true
     }
 
     $output = ""
@@ -2222,7 +2222,7 @@ fi
                 $verifyExit = Invoke-RemoteSsh -RemoteCommand "bash -lc 'command -v codex >/dev/null 2>&1'"
                 if ($verifyExit -eq 0) {
                     Write-Host "remote codex install succeeded."
-                    return
+                    return $true
                 }
             }
             Write-Host "automatic remote codex install failed."
@@ -2231,10 +2231,15 @@ fi
 
     if ($exitCode -eq 255 -or $outputLower -match "connection refused|network error|timed out|timeout|name or service not known|could not resolve|no route to host|connection reset|connection closed|unexpectedly closed network connection|remote side unexpectedly closed") {
         $tail = Get-TextTail -Text $output -MaxLines 10
-        if ([string]::IsNullOrWhiteSpace($tail)) {
-            throw "remote preflight failed due to SSH transport/connectivity issue (exit $exitCode)."
+        if ($script:ProxyType -eq "wss") {
+            Write-Host "wss hint: on the server, run 'sudo systemctl restart sticky-codex-wss.service' and inspect 'journalctl -u sticky-codex-wss.service --no-pager -n 80'."
         }
-        throw "remote preflight failed due to SSH transport/connectivity issue (exit $exitCode). details: $tail"
+        if ([string]::IsNullOrWhiteSpace($tail)) {
+            Write-Host "remote preflight failed due to SSH transport/connectivity issue (exit $exitCode)."
+            return $false
+        }
+        Write-Host "remote preflight failed due to SSH transport/connectivity issue (exit $exitCode). details: $tail"
+        return $false
     }
 
     if ($exitCode -ge 20 -and $exitCode -le 29) {
@@ -2243,9 +2248,11 @@ fi
 
     $tail = Get-TextTail -Text $output -MaxLines 10
     if ([string]::IsNullOrWhiteSpace($tail)) {
-        throw "remote preflight could not complete (exit $exitCode)."
+        Write-Host "remote preflight could not complete (exit $exitCode)."
+        return $false
     }
-    throw "remote preflight could not complete (exit $exitCode). details: $tail"
+    Write-Host "remote preflight could not complete (exit $exitCode). details: $tail"
+    return $false
 }
 
 function Start-ReconnectLoop {
@@ -2329,10 +2336,12 @@ Ensure-QuicLocalProxy
 Ensure-NcatForProxy
 Ensure-PuttyHostKeyCached
 Write-TempSshConfig
-Test-RemotePrereqs
+$preflightReady = Test-RemotePrereqs
 
-if (-not $NoSyncAuth) {
+if (-not $NoSyncAuth -and $preflightReady) {
     Sync-LocalCodexAuthToRemote
+} elseif (-not $NoSyncAuth) {
+    Write-Host "skipping local auth sync until remote connectivity stabilizes."
 }
 
 Start-ReconnectLoop
