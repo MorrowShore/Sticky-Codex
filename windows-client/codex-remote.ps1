@@ -257,9 +257,19 @@ function Invoke-NativeCapture {
 
     $stdoutPath = Join-Path $env:TEMP ("codex-native-out-" + [Guid]::NewGuid().ToString("N") + ".log")
     $stderrPath = Join-Path $env:TEMP ("codex-native-err-" + [Guid]::NewGuid().ToString("N") + ".log")
+    $oldNativePreference = $null
+    $hasNativePreference = $false
 
     try {
-        $proc = Start-Process -FilePath $FilePath -ArgumentList $Arguments -NoNewWindow -PassThru -Wait -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue) {
+            $hasNativePreference = $true
+            $oldNativePreference = $global:PSNativeCommandUseErrorActionPreference
+            $global:PSNativeCommandUseErrorActionPreference = $false
+        }
+
+        & $FilePath @Arguments 1> $stdoutPath 2> $stderrPath
+        $exitCode = $LASTEXITCODE
+
         $output = ""
         if (Test-Path $stdoutPath) {
             $output += (Get-Content -Path $stdoutPath -Raw -ErrorAction SilentlyContinue)
@@ -275,7 +285,7 @@ function Invoke-NativeCapture {
             }
         }
         return @{
-            ExitCode = $proc.ExitCode
+            ExitCode = $exitCode
             Output = $output
         }
     } catch {
@@ -285,11 +295,20 @@ function Invoke-NativeCapture {
         } else {
             $msg = ($_ | Out-String).Trim()
         }
+        $nativeExit = 0
+        try {
+            $nativeExit = [int]$LASTEXITCODE
+        } catch {
+            $nativeExit = 0
+        }
         return @{
-            ExitCode = 1
+            ExitCode = $(if ($nativeExit -gt 0) { $nativeExit } else { 1 })
             Output = $msg
         }
     } finally {
+        if ($hasNativePreference) {
+            $global:PSNativeCommandUseErrorActionPreference = $oldNativePreference
+        }
         Remove-Item -Force -ErrorAction SilentlyContinue $stdoutPath, $stderrPath
     }
 }
@@ -492,6 +511,11 @@ function Build-NcatProxyCommand {
     $type = if ($script:ProxyType -eq "socks5") { "socks5" } else { "http" }
     Normalize-NcatExePath
     $ncatCmd = $script:NcatExe
+    if ($script:SshBackend -eq "putty") {
+        # PuTTY proxycmd parsing treats backslash escapes (for example \n),
+        # which breaks normal Windows paths like ...\Nmap\ncat.exe.
+        $ncatCmd = $ncatCmd -replace '\\', '/'
+    }
     if ($ncatCmd -match "\s") {
         $ncatCmd = '"' + ($ncatCmd -replace '"', '\"') + '"'
     }
