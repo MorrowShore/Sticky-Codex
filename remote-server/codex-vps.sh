@@ -145,18 +145,73 @@ EOF
 install_codex_cli_remote() {
   local sudo_cmd=""
   local attempt delay
+  local codex_path=""
 
   if [ "$(id -u)" -ne 0 ]; then
     if has_command sudo; then
       sudo_cmd="sudo"
-    else
-      echo "automatic codex install requires root privileges or sudo." >&2
-      return 1
     fi
   fi
 
+  add_npm_path() {
+    local prefix nbin
+    if has_command npm; then
+      prefix="$(npm config get prefix 2>/dev/null || true)"
+      if [ -n "$prefix" ] && [ -d "$prefix/bin" ]; then
+        PATH="$prefix/bin:$PATH"
+      fi
+      nbin="$(npm bin -g 2>/dev/null || true)"
+      if [ -n "$nbin" ] && [ -d "$nbin" ]; then
+        PATH="$nbin:$PATH"
+      fi
+    fi
+    PATH="$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
+  }
+
+  find_codex_bin() {
+    local p nbin
+    add_npm_path
+    if has_command "$CODEX_CMD"; then
+      command -v "$CODEX_CMD"
+      return 0
+    fi
+    for p in "$HOME/.npm-global/bin/codex" "$HOME/.local/bin/codex" "/usr/local/bin/codex"; do
+      if [ -x "$p" ]; then
+        printf '%s\n' "$p"
+        return 0
+      fi
+    done
+    if has_command npm; then
+      nbin="$(npm bin -g 2>/dev/null || true)"
+      if [ -n "$nbin" ] && [ -x "$nbin/codex" ]; then
+        printf '%s\n' "$nbin/codex"
+        return 0
+      fi
+    fi
+    return 1
+  }
+
+  link_codex_if_needed() {
+    local candidate="$1"
+    add_npm_path
+    if has_command "$CODEX_CMD"; then
+      return 0
+    fi
+    if [ -w /usr/local/bin ]; then
+      ln -sf "$candidate" /usr/local/bin/codex || true
+    elif [ -n "$sudo_cmd" ]; then
+      $sudo_cmd ln -sf "$candidate" /usr/local/bin/codex || true
+    fi
+    add_npm_path
+    has_command "$CODEX_CMD"
+  }
+
   if ! has_command npm; then
     echo "npm is missing. attempting to install nodejs and npm..."
+    if [ "$(id -u)" -ne 0 ] && [ -z "$sudo_cmd" ]; then
+      echo "npm is missing and sudo is unavailable; cannot install Node.js automatically." >&2
+      return 1
+    fi
     if has_command apt-get; then
       $sudo_cmd apt-get update || true
       $sudo_cmd apt-get install -y nodejs npm || true
@@ -179,8 +234,14 @@ install_codex_cli_remote() {
   fi
 
   for attempt in 1 2 3 4 5; do
-    if npm install -g @openai/codex; then
-      return 0
+    if find_codex_bin >/dev/null 2>&1; then
+      break
+    fi
+    if npm install -g @openai/codex || npm install --location=global @openai/codex; then
+      :
+    fi
+    if find_codex_bin >/dev/null 2>&1; then
+      break
     fi
     if [ "$attempt" -lt 5 ]; then
       delay=$(( attempt * 5 ))
@@ -192,7 +253,23 @@ install_codex_cli_remote() {
     fi
   done
 
-  return 1
+  codex_path="$(find_codex_bin || true)"
+  if [ -z "$codex_path" ]; then
+    echo "codex install completed but codex binary was not found." >&2
+    return 1
+  fi
+
+  if ! link_codex_if_needed "$codex_path"; then
+    echo "codex was found at $codex_path but is not in PATH for non-interactive shells." >&2
+    return 1
+  fi
+
+  if ! "$CODEX_CMD" --version >/dev/null 2>&1; then
+    echo "codex command exists but failed to run '$CODEX_CMD --version'." >&2
+    return 1
+  fi
+
+  return 0
 }
 
 if [ ! -d "$PROJECT_DIR" ]; then

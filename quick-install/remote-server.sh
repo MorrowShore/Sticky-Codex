@@ -157,6 +157,7 @@ install_sing_box_server() {
 
 configure_wss_server_if_selected() {
   local choice wss_port wss_password wss_sni upstream_mode upstream_spec
+  local previous_wss_password
   local config_dir cert_path key_path config_path service_path singbox_bin
   local outbound_block final_tag escaped_pass escaped_sni escaped_host escaped_user escaped_proxy_pass singbox_upstream_type
   local host_hint
@@ -174,6 +175,17 @@ configure_wss_server_if_selected() {
       ;;
   esac
 
+  config_dir="/etc/sticky-codex/wss"
+  cert_path="$config_dir/server.crt"
+  key_path="$config_dir/server.key"
+  config_path="$config_dir/sing-box-server.json"
+  service_path="/etc/systemd/system/sticky-codex-wss.service"
+
+  previous_wss_password=""
+  if sudo test -f "$config_path"; then
+    previous_wss_password="$(sudo sed -n 's/.*"users".*"password"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$config_path" | head -n1 || true)"
+  fi
+
   wss_port="$(prompt_with_default "wss listen port" "13131")"
   case "$wss_port" in
     ''|*[!0-9]*)
@@ -185,8 +197,13 @@ configure_wss_server_if_selected() {
     echo "wss listen port must be in range 1-65535." >&2
     exit 1
   fi
-  read -r -s -p "wss password (for clients): " wss_password
-  printf '\n'
+  if [ -n "$previous_wss_password" ]; then
+    wss_password="$previous_wss_password"
+    echo "reusing previously configured WSS password from $config_path."
+  else
+    read -r -s -p "wss password (for clients): " wss_password
+    printf '\n'
+  fi
   if [ -z "$wss_password" ]; then
     echo "wss password is required." >&2
     exit 1
@@ -212,12 +229,6 @@ configure_wss_server_if_selected() {
   fi
 
   singbox_bin="$(install_sing_box_server)"
-  config_dir="/etc/sticky-codex/wss"
-  cert_path="$config_dir/server.crt"
-  key_path="$config_dir/server.key"
-  config_path="$config_dir/sing-box-server.json"
-  service_path="/etc/systemd/system/sticky-codex-wss.service"
-
   sudo mkdir -p "$config_dir"
 
   if ! has_command openssl; then
@@ -328,7 +339,7 @@ EOF
   echo "  proxy type: wss"
   echo "  wss server host: $host_hint"
   echo "  wss server port: $wss_port"
-  echo "  wss password: (the value you entered)"
+  echo "  wss password: (the value you entered or previously set)"
   echo "  wss tls sni: $wss_sni"
   echo "  wss path: /sticky-codex"
   if [ "$upstream_mode" != "no" ]; then
@@ -368,6 +379,66 @@ install_launcher() {
 
 install_codex_cli_server() {
   local attempt delay
+  local codex_path
+
+  add_npm_path() {
+    local prefix nbin
+    if has_command npm; then
+      prefix="$(npm config get prefix 2>/dev/null || true)"
+      if [ -n "$prefix" ] && [ -d "$prefix/bin" ]; then
+        PATH="$prefix/bin:$PATH"
+      fi
+      nbin="$(npm bin -g 2>/dev/null || true)"
+      if [ -n "$nbin" ] && [ -d "$nbin" ]; then
+        PATH="$nbin:$PATH"
+      fi
+    fi
+    PATH="$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
+  }
+
+  find_codex_bin() {
+    local p nbin
+    add_npm_path
+    if has_command codex; then
+      command -v codex
+      return 0
+    fi
+    for p in "$HOME/.npm-global/bin/codex" "$HOME/.local/bin/codex" "/usr/local/bin/codex"; do
+      if [ -x "$p" ]; then
+        printf '%s\n' "$p"
+        return 0
+      fi
+    done
+    if has_command npm; then
+      nbin="$(npm bin -g 2>/dev/null || true)"
+      if [ -n "$nbin" ] && [ -x "$nbin/codex" ]; then
+        printf '%s\n' "$nbin/codex"
+        return 0
+      fi
+    fi
+    return 1
+  }
+
+  link_codex_if_needed() {
+    local candidate="$1"
+    add_npm_path
+    if has_command codex; then
+      return 0
+    fi
+    if [ -w /usr/local/bin ]; then
+      ln -sf "$candidate" /usr/local/bin/codex || true
+    else
+      sudo ln -sf "$candidate" /usr/local/bin/codex || true
+    fi
+    add_npm_path
+    has_command codex
+  }
+
+  install_codex_package() {
+    npm install -g @openai/codex && return 0
+    npm install --location=global @openai/codex && return 0
+    return 1
+  }
 
   if ! has_command npm; then
     echo "npm is missing. attempting to install nodejs and npm..."
@@ -393,8 +464,14 @@ install_codex_cli_server() {
   fi
 
   for attempt in 1 2 3 4 5; do
-    if npm install -g @openai/codex; then
-      return 0
+    if find_codex_bin >/dev/null 2>&1; then
+      break
+    fi
+    if install_codex_package; then
+      :
+    fi
+    if find_codex_bin >/dev/null 2>&1; then
+      break
     fi
     if [ "$attempt" -lt 5 ]; then
       delay=$(( attempt * 5 ))
@@ -406,7 +483,19 @@ install_codex_cli_server() {
     fi
   done
 
-  return 1
+  codex_path="$(find_codex_bin || true)"
+  if [ -z "$codex_path" ]; then
+    return 1
+  fi
+
+  if ! link_codex_if_needed "$codex_path"; then
+    return 1
+  fi
+
+  if ! codex --version >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
 }
 
 prompt_install_codex_if_missing() {

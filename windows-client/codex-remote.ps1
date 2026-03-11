@@ -898,7 +898,6 @@ function Ensure-QuicLocalProxy {
         if (Test-TcpPort -TargetHost "127.0.0.1" -Port $script:QuicLocalSocksPort -TimeoutMs 600) {
             $script:ProxyType = "socks5"
             $script:ProxySpec = "127.0.0.1:$script:QuicLocalSocksPort"
-            $script:TunnelSshHost = "127.0.0.1"
             return
         }
         if ($proc.HasExited) {
@@ -1004,7 +1003,6 @@ function Ensure-WssLocalProxy {
         if (Test-TcpPort -TargetHost "127.0.0.1" -Port $script:QuicLocalSocksPort -TimeoutMs 600) {
             $script:ProxyType = "socks5"
             $script:ProxySpec = "127.0.0.1:$script:QuicLocalSocksPort"
-            $script:TunnelSshHost = "127.0.0.1"
             return
         }
         if ($proc.HasExited) {
@@ -1791,6 +1789,68 @@ function Invoke-RemoteSsh {
     return $LASTEXITCODE
 }
 
+function Invoke-RemoteSshCapture {
+    param(
+        [string]$RemoteCommand,
+        [switch]$Interactive
+    )
+
+    $output = ""
+    $exitCode = 1
+    $oldNativePreference = $null
+    $hasNativePreference = $false
+
+    if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue) {
+        $hasNativePreference = $true
+        $oldNativePreference = $global:PSNativeCommandUseErrorActionPreference
+        $global:PSNativeCommandUseErrorActionPreference = $false
+    }
+
+    try {
+        if ($script:SshBackend -eq "putty") {
+            $targetHost = Get-SshTargetHost
+            $args = @("-ssh", "-P", "$Port", "-l", $UserName)
+
+            if (-not [string]::IsNullOrWhiteSpace($IdentityFile)) {
+                $args += @("-i", $IdentityFile)
+            }
+
+            if ($AuthMode -eq "password" -and -not [string]::IsNullOrWhiteSpace($Password)) {
+                $args += @("-pw", $Password)
+            }
+
+            $args += Get-PuttyProxyArgs
+
+            if ($Interactive) {
+                $args += @("-t", $targetHost, $RemoteCommand)
+            } else {
+                $args += @("-batch", $targetHost, $RemoteCommand)
+            }
+
+            $output = (& $script:PlinkExe @args 2>&1 | Out-String)
+            $exitCode = $LASTEXITCODE
+        } else {
+            $args = @("-F", $script:SshConfigPath)
+            if ($Interactive) {
+                $args += "-tt"
+            }
+            $args += @($HostAlias, $RemoteCommand)
+
+            $output = (& ssh @args 2>&1 | Out-String)
+            $exitCode = $LASTEXITCODE
+        }
+    } finally {
+        if ($hasNativePreference) {
+            $global:PSNativeCommandUseErrorActionPreference = $oldNativePreference
+        }
+    }
+
+    return @{
+        ExitCode = $exitCode
+        Output = $output
+    }
+}
+
 function Invoke-RemoteScp {
     param(
         [string]$LocalPath,
@@ -1829,37 +1889,118 @@ SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
   if has_command sudo; then
     SUDO="sudo"
+  fi
+fi
+
+run_priv() {
+  if [ -n "$SUDO" ]; then
+    "$SUDO" "$@"
   else
-    echo "remote install requires root privileges or sudo." >&2
-    exit 1
+    "$@"
   fi
-fi
+}
 
-if ! has_command npm; then
+add_npm_path() {
+  local prefix nbin
+  if has_command npm; then
+    prefix="$(npm config get prefix 2>/dev/null || true)"
+    if [ -n "$prefix" ] && [ -d "$prefix/bin" ]; then
+      PATH="$prefix/bin:$PATH"
+    fi
+    nbin="$(npm bin -g 2>/dev/null || true)"
+    if [ -n "$nbin" ] && [ -d "$nbin" ]; then
+      PATH="$nbin:$PATH"
+    fi
+  fi
+  PATH="$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
+}
+
+find_codex_bin() {
+  local p nbin
+  add_npm_path
+  if has_command codex; then
+    command -v codex
+    return 0
+  fi
+  for p in "$HOME/.npm-global/bin/codex" "$HOME/.local/bin/codex" "/usr/local/bin/codex"; do
+    if [ -x "$p" ]; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+  done
+  if has_command npm; then
+    nbin="$(npm bin -g 2>/dev/null || true)"
+    if [ -n "$nbin" ] && [ -x "$nbin/codex" ]; then
+      printf '%s\n' "$nbin/codex"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+ensure_npm() {
+  if has_command npm; then
+    return 0
+  fi
+
+  if [ "$(id -u)" -ne 0 ] && [ -z "$SUDO" ]; then
+    echo "npm is missing and sudo is not available; cannot install Node.js automatically." >&2
+    return 1
+  fi
+
   if has_command apt-get; then
-    $SUDO apt-get update || true
-    $SUDO apt-get install -y nodejs npm || true
+    run_priv apt-get update || true
+    run_priv apt-get install -y nodejs npm || true
   elif has_command dnf; then
-    $SUDO dnf install -y nodejs npm || true
+    run_priv dnf install -y nodejs npm || true
   elif has_command yum; then
-    $SUDO yum install -y nodejs npm || true
+    run_priv yum install -y nodejs npm || true
   elif has_command pacman; then
-    $SUDO pacman -Sy --noconfirm nodejs npm || true
+    run_priv pacman -Sy --noconfirm nodejs npm || true
   elif has_command zypper; then
-    $SUDO zypper --non-interactive install nodejs npm || true
+    run_priv zypper --non-interactive install nodejs npm || true
   elif has_command apk; then
-    $SUDO apk add nodejs npm || true
+    run_priv apk add nodejs npm || true
   fi
-fi
 
-if ! has_command npm; then
+  has_command npm
+}
+
+install_codex_package() {
+  npm install -g @openai/codex && return 0
+  npm install --location=global @openai/codex && return 0
+  return 1
+}
+
+link_codex_if_needed() {
+  local codex_path="$1"
+  add_npm_path
+  if has_command codex; then
+    return 0
+  fi
+  if [ -w /usr/local/bin ]; then
+    ln -sf "$codex_path" /usr/local/bin/codex || true
+  elif [ -n "$SUDO" ]; then
+    run_priv ln -sf "$codex_path" /usr/local/bin/codex || true
+  fi
+  add_npm_path
+  has_command codex
+}
+
+if ! ensure_npm; then
   echo "remote install could not find npm even after package install attempts." >&2
   exit 1
 fi
 
 attempt=1
 while [ "$attempt" -le 5 ]; do
-  if npm install -g @openai/codex; then
+  if find_codex_bin >/dev/null 2>&1; then
+    break
+  fi
+  if install_codex_package; then
+    :
+  fi
+  if find_codex_bin >/dev/null 2>&1; then
     break
   fi
   if [ "$attempt" -lt 5 ]; then
@@ -1873,8 +2014,19 @@ while [ "$attempt" -le 5 ]; do
   attempt=$((attempt + 1))
 done
 
-if ! has_command codex; then
-  echo "remote codex install completed but codex is still missing from PATH." >&2
+codex_path="$(find_codex_bin || true)"
+if [ -z "$codex_path" ]; then
+  echo "remote codex install completed but codex binary was not found." >&2
+  exit 1
+fi
+
+if ! link_codex_if_needed "$codex_path"; then
+  echo "codex was found at $codex_path but is not in PATH for non-interactive shells." >&2
+  exit 1
+fi
+
+if ! codex --version >/dev/null 2>&1; then
+  echo "codex command exists but failed to run 'codex --version'." >&2
   exit 1
 fi
 '@
@@ -1901,9 +2053,13 @@ do this on Windows first:
     }
 
     Write-Host "syncing local Codex auth to VPS..."
-    $prepareExit = Invoke-RemoteSsh -RemoteCommand "mkdir -p ~/.codex && chmod 700 ~/.codex"
-    if ($prepareExit -ne 0) {
-        throw "failed to prepare ~/.codex on the remote host."
+    $prepareResult = Invoke-RemoteSshCapture -RemoteCommand "mkdir -p ~/.codex && chmod 700 ~/.codex"
+    if ($prepareResult.ExitCode -ne 0) {
+        $tail = Get-TextTail -Text ([string]$prepareResult.Output) -MaxLines 10
+        if ([string]::IsNullOrWhiteSpace($tail)) {
+            throw "failed to prepare ~/.codex on the remote host."
+        }
+        throw "failed to prepare ~/.codex on the remote host. details: $tail"
     }
 
     $copyExit = Invoke-RemoteScp -LocalPath $localAuth -RemotePath "~/.codex/auth.json"
@@ -1975,12 +2131,20 @@ if ! command -v codex >/dev/null 2>&1; then
 fi
 "@
     $cmd = "bash -lc " + (Quote-ForBashSingle $check)
-    $exitCode = Invoke-RemoteSsh -RemoteCommand $cmd
+    $result = Invoke-RemoteSshCapture -RemoteCommand $cmd
+    $exitCode = $result.ExitCode
     if ($exitCode -eq 0) {
         return
     }
 
-    if ($exitCode -eq 22 -and [Environment]::UserInteractive) {
+    $output = ""
+    if ($null -ne $result.Output) {
+        $output = [string]$result.Output
+    }
+    $outputLower = $output.ToLowerInvariant()
+    $missingCodexDetected = ($exitCode -eq 22 -or ($outputLower -match "codex is not installed or not in path on the remote host"))
+
+    if ($missingCodexDetected -and [Environment]::UserInteractive) {
         $choice = (Prompt-WithDefault -Prompt "remote codex is missing on $HostAlias. install now? (Y/n)" -Default "Y").ToLowerInvariant()
         if ($choice -notin @("n", "no")) {
             Write-Host "installing codex on remote host..."
@@ -1995,11 +2159,23 @@ fi
         }
     }
 
+    if ($exitCode -eq 255 -or $outputLower -match "connection refused|network error|timed out|timeout|name or service not known|could not resolve|no route to host|connection reset|connection closed") {
+        $tail = Get-TextTail -Text $output -MaxLines 10
+        if ([string]::IsNullOrWhiteSpace($tail)) {
+            throw "remote preflight failed due to SSH transport/connectivity issue (exit $exitCode)."
+        }
+        throw "remote preflight failed due to SSH transport/connectivity issue (exit $exitCode). details: $tail"
+    }
+
     if ($exitCode -ge 20 -and $exitCode -le 29) {
         throw "remote preflight failed with exit code $exitCode."
     }
 
-    Write-Host "remote preflight could not complete (exit $exitCode). continuing into reconnect loop."
+    $tail = Get-TextTail -Text $output -MaxLines 10
+    if ([string]::IsNullOrWhiteSpace($tail)) {
+        throw "remote preflight could not complete (exit $exitCode)."
+    }
+    throw "remote preflight could not complete (exit $exitCode). details: $tail"
 }
 
 function Start-ReconnectLoop {

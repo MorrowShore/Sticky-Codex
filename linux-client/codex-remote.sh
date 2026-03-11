@@ -1352,7 +1352,6 @@ EOF
     if tcp_port_open "127.0.0.1" "$QUIC_LOCAL_SOCKS_PORT"; then
       PROXY_TYPE="socks5"
       PROXY_SPEC="127.0.0.1:$QUIC_LOCAL_SOCKS_PORT"
-      TUNNEL_SSH_HOST="127.0.0.1"
       return
     fi
     if ! kill -0 "$QUIC_PID" >/dev/null 2>&1; then
@@ -1504,7 +1503,6 @@ EOF
     if tcp_port_open "127.0.0.1" "$QUIC_LOCAL_SOCKS_PORT"; then
       PROXY_TYPE="socks5"
       PROXY_SPEC="127.0.0.1:$QUIC_LOCAL_SOCKS_PORT"
-      TUNNEL_SSH_HOST="127.0.0.1"
       return
     fi
     if ! kill -0 "$QUIC_PID" >/dev/null 2>&1; then
@@ -1573,31 +1571,122 @@ install_remote_codex_cli() {
 set -e
 has_command() { command -v "$1" >/dev/null 2>&1; }
 
-if ! has_command npm; then
-  if has_command apt-get; then
-    apt-get update || true
-    apt-get install -y nodejs npm || true
-  elif has_command dnf; then
-    dnf install -y nodejs npm || true
-  elif has_command yum; then
-    yum install -y nodejs npm || true
-  elif has_command pacman; then
-    pacman -Sy --noconfirm nodejs npm || true
-  elif has_command zypper; then
-    zypper --non-interactive install nodejs npm || true
-  elif has_command apk; then
-    apk add nodejs npm || true
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+  if has_command sudo; then
+    SUDO="sudo"
   fi
 fi
 
-if ! has_command npm; then
+run_priv() {
+  if [ -n "$SUDO" ]; then
+    "$SUDO" "$@"
+  else
+    "$@"
+  fi
+}
+
+add_npm_path() {
+  local prefix nbin
+  if has_command npm; then
+    prefix="$(npm config get prefix 2>/dev/null || true)"
+    if [ -n "$prefix" ] && [ -d "$prefix/bin" ]; then
+      PATH="$prefix/bin:$PATH"
+    fi
+    nbin="$(npm bin -g 2>/dev/null || true)"
+    if [ -n "$nbin" ] && [ -d "$nbin" ]; then
+      PATH="$nbin:$PATH"
+    fi
+  fi
+  PATH="$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
+}
+
+find_codex_bin() {
+  local p nbin
+  add_npm_path
+  if has_command codex; then
+    command -v codex
+    return 0
+  fi
+  for p in "$HOME/.npm-global/bin/codex" "$HOME/.local/bin/codex" "/usr/local/bin/codex"; do
+    if [ -x "$p" ]; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+  done
+  if has_command npm; then
+    nbin="$(npm bin -g 2>/dev/null || true)"
+    if [ -n "$nbin" ] && [ -x "$nbin/codex" ]; then
+      printf '%s\n' "$nbin/codex"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+ensure_npm() {
+  if has_command npm; then
+    return 0
+  fi
+
+  if [ "$(id -u)" -ne 0 ] && [ -z "$SUDO" ]; then
+    echo "npm is missing and sudo is not available; cannot install Node.js automatically." >&2
+    return 1
+  fi
+
+  if has_command apt-get; then
+    run_priv apt-get update || true
+    run_priv apt-get install -y nodejs npm || true
+  elif has_command dnf; then
+    run_priv dnf install -y nodejs npm || true
+  elif has_command yum; then
+    run_priv yum install -y nodejs npm || true
+  elif has_command pacman; then
+    run_priv pacman -Sy --noconfirm nodejs npm || true
+  elif has_command zypper; then
+    run_priv zypper --non-interactive install nodejs npm || true
+  elif has_command apk; then
+    run_priv apk add nodejs npm || true
+  fi
+
+  has_command npm
+}
+
+install_codex_package() {
+  npm install -g @openai/codex && return 0
+  npm install --location=global @openai/codex && return 0
+  return 1
+}
+
+link_codex_if_needed() {
+  local codex_path="$1"
+  add_npm_path
+  if has_command codex; then
+    return 0
+  fi
+  if [ -w /usr/local/bin ]; then
+    ln -sf "$codex_path" /usr/local/bin/codex || true
+  elif [ -n "$SUDO" ]; then
+    run_priv ln -sf "$codex_path" /usr/local/bin/codex || true
+  fi
+  add_npm_path
+  has_command codex
+}
+
+if ! ensure_npm; then
   echo "remote install could not find npm even after package install attempts." >&2
   exit 1
 fi
 
 attempt=1
 while [ "$attempt" -le 5 ]; do
-  if npm install -g @openai/codex; then
+  if find_codex_bin >/dev/null 2>&1; then
+    break
+  fi
+  if install_codex_package; then
+    :
+  fi
+  if find_codex_bin >/dev/null 2>&1; then
     break
   fi
   if [ "$attempt" -lt 5 ]; then
@@ -1611,8 +1700,19 @@ while [ "$attempt" -le 5 ]; do
   attempt=$((attempt + 1))
 done
 
-if ! has_command codex; then
-  echo "remote codex install completed but codex is still missing from PATH." >&2
+codex_path="$(find_codex_bin || true)"
+if [ -z "$codex_path" ]; then
+  echo "remote codex install completed but codex binary was not found." >&2
+  exit 1
+fi
+
+if ! link_codex_if_needed "$codex_path"; then
+  echo "codex was found at $codex_path but is not in PATH for non-interactive shells." >&2
+  exit 1
+fi
+
+if ! codex --version >/dev/null 2>&1; then
+  echo "codex command exists but failed to run 'codex --version'." >&2
   exit 1
 fi
 EOF
@@ -1649,11 +1749,10 @@ quote_for_bash_single() {
 }
 
 write_temp_ssh_config() {
-  local proxy_command ssh_host_for_tunnel
-  ssh_host_for_tunnel="${TUNNEL_SSH_HOST:-$HOST_NAME}"
+  local proxy_command
   {
     printf 'Host %s\n' "$HOST_ALIAS"
-    printf '    HostName %s\n' "$ssh_host_for_tunnel"
+    printf '    HostName %s\n' "$HOST_NAME"
     printf '    User %s\n' "$USER_NAME"
     printf '    Port %s\n' "$PORT"
     printf '    ServerAliveInterval 15\n'
@@ -1760,7 +1859,7 @@ start_reconnect_loop() {
 }
 
 test_remote_prereqs() {
-  local remote_script_arg project_arg check_cmd cmd exit_code install_choice
+  local remote_script_arg project_arg check_cmd cmd exit_code install_choice preflight_output output_lower
 
   remote_script_arg="$(quote_for_bash_single "$REMOTE_SCRIPT")"
   project_arg="$(quote_for_bash_single "$REMOTE_PROJECT_DIR")"
@@ -1768,12 +1867,13 @@ test_remote_prereqs() {
   check_cmd="$check_cmd; if ! command -v codex >/dev/null 2>&1; then echo 'codex is not installed or not in PATH on the remote host.' >&2; exit 22; fi"
   cmd="bash -lc $(quote_for_bash_single "$check_cmd")"
 
-  if run_ssh -F "$SSH_CONFIG_PATH" "$HOST_ALIAS" "$cmd"; then
+  preflight_output="$(run_ssh -F "$SSH_CONFIG_PATH" "$HOST_ALIAS" "$cmd" 2>&1)" && {
     return
-  fi
+  }
   exit_code="$?"
+  output_lower="$(printf '%s' "$preflight_output" | tr '[:upper:]' '[:lower:]')"
 
-  if [ "$exit_code" -eq 22 ] && [ -t 0 ]; then
+  if { [ "$exit_code" -eq 22 ] || printf '%s' "$output_lower" | grep -q "codex is not installed or not in path on the remote host"; } && [ -t 0 ]; then
     install_choice="$(prompt_with_default "remote codex is missing on $HOST_ALIAS. install now? (Y/n)" "Y")"
     case "$(printf '%s' "$install_choice" | tr '[:upper:]' '[:lower:]')" in
       n|no)
@@ -1791,12 +1891,26 @@ test_remote_prereqs() {
     esac
   fi
 
+  if [ "$exit_code" -eq 255 ] || printf '%s' "$output_lower" | grep -Eq "connection refused|network error|timed out|timeout|name or service not known|could not resolve|no route to host|connection reset|connection closed"; then
+    if [ -n "$preflight_output" ]; then
+      echo "remote preflight failed due to SSH transport/connectivity issue (exit $exit_code): $preflight_output" >&2
+    else
+      echo "remote preflight failed due to SSH transport/connectivity issue (exit $exit_code)." >&2
+    fi
+    exit 1
+  fi
+
   if [ "$exit_code" -ge 20 ] && [ "$exit_code" -le 29 ]; then
     echo "remote preflight failed with exit code $exit_code." >&2
     exit 1
   fi
 
-  echo "remote preflight could not complete (exit $exit_code). continuing into reconnect loop."
+  if [ -n "$preflight_output" ]; then
+    echo "remote preflight could not complete (exit $exit_code): $preflight_output" >&2
+  else
+    echo "remote preflight could not complete (exit $exit_code)." >&2
+  fi
+  exit 1
 }
 
 cleanup_local_helpers() {
