@@ -273,8 +273,11 @@ install_codex_cli_remote() {
 }
 
 if [ ! -d "$PROJECT_DIR" ]; then
-  echo "project directory does not exist: $PROJECT_DIR" >&2
-  exit 1
+  echo "project directory did not exist; creating: $PROJECT_DIR" >&2
+  if ! mkdir -p "$PROJECT_DIR"; then
+    echo "failed to create project directory: $PROJECT_DIR" >&2
+    exit 1
+  fi
 fi
 
 ensure_tmux

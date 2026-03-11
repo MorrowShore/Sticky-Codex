@@ -9,7 +9,7 @@ IDENTITY_FILE=""
 REMOTE_PROJECT_DIR=""
 SESSION_NAME=""
 IDLE_DAYS="7"
-RECONNECT_DELAY_SECONDS="3"
+RECONNECT_DELAY_SECONDS="1"
 SYNC_AUTH="1"
 REMOTE_SCRIPT="/usr/local/bin/codex-vps"
 AUTH_MODE="auto"
@@ -68,7 +68,7 @@ options:
   --remote-project-dir PATH
   --session-name NAME
   --idle-days 7
-  --reconnect-delay-seconds 3
+  --reconnect-delay-seconds 1
   --auth-mode auto|key|password
   --password VALUE
   --proxy-type no|socks5|http|wss
@@ -631,6 +631,16 @@ ensure_required_connection_values() {
     [ -n "$HOST_ALIAS" ] || HOST_ALIAS="myvps"
     [ -n "$AUTH_MODE" ] || AUTH_MODE="auto"
     AUTH_MODE="$(normalize_auth_mode "$AUTH_MODE")"
+    case "$RECONNECT_DELAY_SECONDS" in
+      ''|*[!0-9]*)
+        RECONNECT_DELAY_SECONDS="1"
+        ;;
+      *)
+        if [ "$RECONNECT_DELAY_SECONDS" -lt 1 ]; then
+          RECONNECT_DELAY_SECONDS="1"
+        fi
+        ;;
+    esac
     if [ "$AUTH_MODE" = "password" ] && [ -z "$PASSWORD" ]; then
       echo "auth mode 'password' requires a saved password in the profile (PASSWORD_B64) or --password." >&2
       exit 1
@@ -757,7 +767,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --reconnect-delay-seconds)
-      RECONNECT_DELAY_SECONDS="${2:-3}"
+      RECONNECT_DELAY_SECONDS="${2:-1}"
       RECONNECT_DELAY_SECONDS_SET="1"
       shift 2
       ;;
@@ -1790,9 +1800,6 @@ write_temp_ssh_config() {
 
 start_reconnect_loop() {
   local project_arg session_arg launch_cmd remote_cmd exit_code delay
-  local started_at elapsed rapid_failures max_pow exp_delay i
-
-  rapid_failures=0
 
   project_arg="$(quote_for_bash_single "$REMOTE_PROJECT_DIR")"
   session_arg="$(quote_for_bash_single "$SESSION_NAME")"
@@ -1800,7 +1807,6 @@ start_reconnect_loop() {
   remote_cmd="bash -lc $(quote_for_bash_single "$launch_cmd")"
 
   while true; do
-    started_at="$(date +%s)"
     printf '\n'
     printf 'connecting to %s | session=%s | project=%s\n' "$HOST_ALIAS" "$SESSION_NAME" "$REMOTE_PROJECT_DIR"
     if run_ssh -tt -F "$SSH_CONFIG_PATH" "$HOST_ALIAS" "$remote_cmd"; then
@@ -1808,48 +1814,13 @@ start_reconnect_loop() {
     else
       exit_code="$?"
     fi
-    elapsed="$(( $(date +%s) - started_at ))"
-
-    if [ "$elapsed" -lt 10 ]; then
-      rapid_failures="$((rapid_failures + 1))"
-    else
-      rapid_failures=0
-    fi
-
-    delay="$RECONNECT_DELAY_SECONDS"
-    if [ "$rapid_failures" -ge 2 ]; then
-      max_pow="$((rapid_failures - 1))"
-      if [ "$max_pow" -gt 5 ]; then
-        max_pow=5
-      fi
-
-      exp_delay="$RECONNECT_DELAY_SECONDS"
-      i=0
-      while [ "$i" -lt "$max_pow" ]; do
-        exp_delay="$((exp_delay * 2))"
-        if [ "$exp_delay" -ge 60 ]; then
-          exp_delay=60
-          break
-        fi
-        i="$((i + 1))"
-      done
-
-      if [ "$delay" -lt "$exp_delay" ]; then
-        delay="$exp_delay"
-      fi
-    fi
+    delay="1"
 
     if [ "$exit_code" -ne 0 ]; then
       printf 'remote launcher exited with code %s.\n' "$exit_code"
     fi
     if [ "$exit_code" -eq 255 ]; then
       printf 'ssh transport failed (exit 255). check sshd/firewall/fail2ban/network reachability.\n'
-      if [ "$delay" -lt 10 ]; then
-        delay="10"
-      fi
-    fi
-    if [ "$rapid_failures" -ge 3 ]; then
-      printf 'remote session is exiting quickly repeatedly. check remote tmux/codex startup state.\n'
     fi
 
     printf '\n'
@@ -1863,14 +1834,18 @@ test_remote_prereqs() {
 
   remote_script_arg="$(quote_for_bash_single "$REMOTE_SCRIPT")"
   project_arg="$(quote_for_bash_single "$REMOTE_PROJECT_DIR")"
-  check_cmd="if [ ! -x $remote_script_arg ]; then echo 'remote script not found or not executable: $REMOTE_SCRIPT' >&2; exit 20; fi; if [ ! -d $project_arg ]; then echo 'remote project directory not found: $REMOTE_PROJECT_DIR' >&2; exit 21; fi"
+  check_cmd="if [ ! -x $remote_script_arg ]; then echo 'remote script not found or not executable: $REMOTE_SCRIPT' >&2; exit 20; fi; if [ ! -d $project_arg ]; then echo 'remote project directory not found; creating: $REMOTE_PROJECT_DIR' >&2; if ! mkdir -p $project_arg; then echo 'failed to create remote project directory: $REMOTE_PROJECT_DIR' >&2; exit 21; fi; fi"
   check_cmd="$check_cmd; if ! command -v codex >/dev/null 2>&1; then echo 'codex is not installed or not in PATH on the remote host.' >&2; exit 22; fi"
   cmd="bash -lc $(quote_for_bash_single "$check_cmd")"
 
-  preflight_output="$(run_ssh -F "$SSH_CONFIG_PATH" "$HOST_ALIAS" "$cmd" 2>&1)" && {
-    return 0
-  }
+  preflight_output="$(run_ssh -F "$SSH_CONFIG_PATH" "$HOST_ALIAS" "$cmd" 2>&1)"
   exit_code="$?"
+  if [ "$exit_code" -eq 0 ]; then
+    if [ -n "$preflight_output" ]; then
+      echo "remote preflight: $preflight_output"
+    fi
+    return 0
+  fi
   output_lower="$(printf '%s' "$preflight_output" | tr '[:upper:]' '[:lower:]')"
 
   if { [ "$exit_code" -eq 22 ] || printf '%s' "$output_lower" | grep -q "codex is not installed or not in path on the remote host"; } && [ -t 0 ]; then

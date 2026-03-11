@@ -25,7 +25,7 @@ param(
     [string]$RemoteProjectDir = "",
     [string]$SessionName = "",
     [int]$IdleDays = 7,
-    [int]$ReconnectDelaySeconds = 3,
+    [int]$ReconnectDelaySeconds = 1,
     [switch]$NoSyncAuth,
     [string]$RemoteScript = "/usr/local/bin/codex-vps",
     [ValidateSet("auto", "key", "password")]
@@ -76,7 +76,7 @@ options:
   -RemoteProjectDir /srv/project
   -SessionName codex-project
   -IdleDays 7
-  -ReconnectDelaySeconds 3
+  -ReconnectDelaySeconds 1
   -AuthMode auto|key|password
   -Password yourpassword
   -ProxyType no|socks5|http|wss
@@ -247,6 +247,51 @@ function Get-TextTail {
 
     $tail = $trimmed[($trimmed.Count - $MaxLines)..($trimmed.Count - 1)]
     return ($tail -join " | ")
+}
+
+function Invoke-NativeCapture {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments
+    )
+
+    $stdoutPath = Join-Path $env:TEMP ("codex-native-out-" + [Guid]::NewGuid().ToString("N") + ".log")
+    $stderrPath = Join-Path $env:TEMP ("codex-native-err-" + [Guid]::NewGuid().ToString("N") + ".log")
+
+    try {
+        $proc = Start-Process -FilePath $FilePath -ArgumentList $Arguments -NoNewWindow -PassThru -Wait -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        $output = ""
+        if (Test-Path $stdoutPath) {
+            $output += (Get-Content -Path $stdoutPath -Raw -ErrorAction SilentlyContinue)
+        }
+        if (Test-Path $stderrPath) {
+            $stderr = Get-Content -Path $stderrPath -Raw -ErrorAction SilentlyContinue
+            if (-not [string]::IsNullOrWhiteSpace($stderr)) {
+                if ([string]::IsNullOrWhiteSpace($output)) {
+                    $output = $stderr
+                } else {
+                    $output = ($output.TrimEnd() + [Environment]::NewLine + $stderr).Trim()
+                }
+            }
+        }
+        return @{
+            ExitCode = $proc.ExitCode
+            Output = $output
+        }
+    } catch {
+        $msg = ""
+        if ($_.Exception -and -not [string]::IsNullOrWhiteSpace($_.Exception.Message)) {
+            $msg = $_.Exception.Message
+        } else {
+            $msg = ($_ | Out-String).Trim()
+        }
+        return @{
+            ExitCode = 1
+            Output = $msg
+        }
+    } finally {
+        Remove-Item -Force -ErrorAction SilentlyContinue $stdoutPath, $stderrPath
+    }
 }
 
 function Classify-WingetFailure {
@@ -1487,6 +1532,9 @@ function Ensure-RequiredConnectionValues {
         if ([string]::IsNullOrWhiteSpace($script:HostAlias)) {
             $script:HostAlias = "myvps"
         }
+        if ($script:ReconnectDelaySeconds -lt 1) {
+            $script:ReconnectDelaySeconds = 1
+        }
         if ($script:AuthMode -eq "password" -and [string]::IsNullOrWhiteSpace($script:Password)) {
             throw "auth mode 'password' requires a saved password in the profile (PASSWORD_B64) or -Password."
         }
@@ -1689,30 +1737,9 @@ function Ensure-PuttyHostKeyCached {
     $batchArgs += Get-PuttyProxyArgs
     $batchArgs += @($targetHost, "true")
 
-    $batchOutput = ""
-    $batchExit = 1
-    $oldNativePreference = $null
-    $hasNativePreference = $false
-    if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue) {
-        $hasNativePreference = $true
-        $oldNativePreference = $global:PSNativeCommandUseErrorActionPreference
-        $global:PSNativeCommandUseErrorActionPreference = $false
-    }
-    try {
-        try {
-            $batchOutput = (& $script:PlinkExe @batchArgs 2>&1 | Out-String)
-            $batchExit = $LASTEXITCODE
-        } catch {
-            $batchOutput = ($_ | Out-String)
-            if ($LASTEXITCODE -ne 0) {
-                $batchExit = $LASTEXITCODE
-            }
-        }
-    } finally {
-        if ($hasNativePreference) {
-            $global:PSNativeCommandUseErrorActionPreference = $oldNativePreference
-        }
-    }
+    $batchResult = Invoke-NativeCapture -FilePath $script:PlinkExe -Arguments $batchArgs
+    $batchOutput = [string]$batchResult.Output
+    $batchExit = [int]$batchResult.ExitCode
     if ($batchExit -eq 0) {
         return
     }
@@ -1850,8 +1877,9 @@ function Invoke-RemoteSshCapture {
                 $args += @("-batch", $targetHost, $RemoteCommand)
             }
 
-            $output = (& $script:PlinkExe @args 2>&1 | Out-String)
-            $exitCode = $LASTEXITCODE
+            $native = Invoke-NativeCapture -FilePath $script:PlinkExe -Arguments $args
+            $output = [string]$native.Output
+            $exitCode = [int]$native.ExitCode
         } else {
             $args = @("-F", $script:SshConfigPath)
             if ($Interactive) {
@@ -2192,8 +2220,11 @@ if [ ! -x $remoteScriptArg ]; then
   exit 20
 fi
 if [ ! -d $projectArg ]; then
-  echo "remote project directory not found: $RemoteProjectDir" >&2
-  exit 21
+  echo "remote project directory not found; creating: $RemoteProjectDir" >&2
+  if ! mkdir -p $projectArg; then
+    echo "failed to create remote project directory: $RemoteProjectDir" >&2
+    exit 21
+  fi
 fi
 if ! command -v codex >/dev/null 2>&1; then
   echo "codex is not installed or not in PATH on the remote host." >&2
@@ -2204,6 +2235,16 @@ fi
     $result = Invoke-RemoteSshCapture -RemoteCommand $cmd
     $exitCode = $result.ExitCode
     if ($exitCode -eq 0) {
+        $okOutput = ""
+        if ($null -ne $result.Output) {
+            $okOutput = [string]$result.Output
+        }
+        if (-not [string]::IsNullOrWhiteSpace($okOutput)) {
+            $tail = Get-TextTail -Text $okOutput -MaxLines 6
+            if (-not [string]::IsNullOrWhiteSpace($tail)) {
+                Write-Host "remote preflight: $tail"
+            }
+        }
         return $true
     }
 
@@ -2256,46 +2297,22 @@ fi
 }
 
 function Start-ReconnectLoop {
-    $rapidFailures = 0
-
     $projectArg = Quote-ForBashSingle $RemoteProjectDir
     $sessionArg = Quote-ForBashSingle $SessionName
     $launchCmd = "$RemoteScript --project-dir $projectArg --session-name $sessionArg --idle-days $IdleDays"
     $remoteCmd = "bash -lc " + (Quote-ForBashSingle $launchCmd)
 
     while ($true) {
-        $startedAt = Get-Date
         Write-Host ""
         Write-Host "connecting to $HostAlias | session=$SessionName | project=$RemoteProjectDir"
         $exitCode = Invoke-RemoteSsh -Interactive -RemoteCommand $remoteCmd
-        $elapsed = [int]((Get-Date) - $startedAt).TotalSeconds
-
-        $delay = $ReconnectDelaySeconds
-        if ($elapsed -lt 10) {
-            $rapidFailures += 1
-        } else {
-            $rapidFailures = 0
-        }
-
-        if ($rapidFailures -ge 2) {
-            $maxPow = [Math]::Min(5, $rapidFailures - 1)
-            $expDelay = [int]([Math]::Min(60, $ReconnectDelaySeconds * [Math]::Pow(2, $maxPow)))
-            if ($delay -lt $expDelay) {
-                $delay = $expDelay
-            }
-        }
+        $delay = 1
 
         if ($exitCode -ne 0) {
             Write-Host "remote launcher exited with code $exitCode."
         }
         if ($exitCode -eq 255) {
             Write-Host "ssh transport failed (exit 255). check sshd/firewall/fail2ban/network reachability."
-            if ($delay -lt 10) {
-                $delay = 10
-            }
-        }
-        if ($rapidFailures -ge 3) {
-            Write-Host "remote session is exiting quickly repeatedly. check remote tmux/codex startup state."
         }
 
         Write-Host ""
