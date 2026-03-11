@@ -55,9 +55,24 @@ $script:SingBoxExe = "sing-box"
 $script:QuicRunner = $null
 $script:TunnelSshHost = ""
 $script:PuttyHostKeyPins = @()
+$script:LastRemoteSshExitCode = 0
 $script:CliBoundParams = @{}
 foreach ($k in $PSBoundParameters.Keys) {
     $script:CliBoundParams[$k] = $true
+}
+
+function Configure-ConsoleUtf8 {
+    if (-not [Environment]::UserInteractive) {
+        return
+    }
+
+    try {
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        [Console]::InputEncoding = $utf8
+        [Console]::OutputEncoding = $utf8
+        $global:OutputEncoding = $utf8
+    } catch {
+    }
 }
 
 function Show-Banner {
@@ -523,8 +538,10 @@ function Build-NcatProxyCommand {
         # PuTTY proxycmd parsing treats backslash escapes (for example \n),
         # which breaks normal Windows paths like ...\Nmap\ncat.exe.
         $ncatCmd = $ncatCmd -replace '\\', '/'
-    }
-    if ($ncatCmd -match "\s") {
+        if ($ncatCmd -match "\s") {
+            throw "ncat path '$ncatCmd' still contains spaces; unable to build a reliable PuTTY proxy command."
+        }
+    } elseif ($ncatCmd -match "\s") {
         $ncatCmd = '"' + ($ncatCmd -replace '"', '\"') + '"'
     }
 
@@ -560,16 +577,32 @@ function Normalize-NcatExePath {
     if ([string]::IsNullOrWhiteSpace($script:NcatExe)) {
         return
     }
-    if ($script:NcatExe -notmatch "\s") {
-        return
-    }
 
     if ($script:SshBackend -eq "putty") {
         # Keep ncat in its original install directory so required DLLs resolve.
         $short = Get-ShortWindowsPath -Path $script:NcatExe
-        if (-not [string]::IsNullOrWhiteSpace($short)) {
+        if (-not [string]::IsNullOrWhiteSpace($short) -and $short -notmatch "\s") {
             $script:NcatExe = $short
+            return
         }
+
+        if ($script:NcatExe -match "\s") {
+            # Some systems disable 8.3 names. Copy ncat + sibling DLLs to a stable
+            # path without spaces so PuTTY -proxycmd can execute it reliably.
+            $srcDir = Split-Path -Parent $script:NcatExe
+            $leaf = Split-Path -Leaf $script:NcatExe
+            $destDir = Join-Path $env:LOCALAPPDATA "sticky-codex\tools\ncat-runtime"
+            $null = New-Item -ItemType Directory -Force -Path $destDir
+            Copy-Item -Path (Join-Path $srcDir "*") -Destination $destDir -Recurse -Force
+            $destExe = Join-Path $destDir $leaf
+            if (Test-Path $destExe) {
+                $script:NcatExe = $destExe
+            }
+        }
+    }
+
+    if ($script:NcatExe -match "\s") {
+        return
     }
 }
 
@@ -1969,6 +2002,8 @@ function Invoke-RemoteSsh {
         [switch]$Interactive
     )
 
+    $script:LastRemoteSshExitCode = 1
+
     if ($script:SshBackend -eq "putty") {
         $targetHost = Get-SshTargetHost
         $args = @("-ssh", "-P", "$Port", "-l", $UserName)
@@ -1993,13 +2028,17 @@ function Invoke-RemoteSsh {
         }
         try {
             if ($Interactive) {
-                $args += @("-t", $targetHost, $RemoteCommand)
+                $args += @("-no-antispoof", "-t", $targetHost, $RemoteCommand)
                 & $script:PlinkExe @args
             } else {
                 $args += @("-batch", $targetHost, $RemoteCommand)
                 & $script:PlinkExe @args
             }
-            return $LASTEXITCODE
+            $script:LastRemoteSshExitCode = [int]$LASTEXITCODE
+            if (-not $Interactive) {
+                return $script:LastRemoteSshExitCode
+            }
+            return
         } catch {
             $nativeExit = 0
             try {
@@ -2008,9 +2047,14 @@ function Invoke-RemoteSsh {
                 $nativeExit = 0
             }
             if ($nativeExit -gt 0) {
-                return $nativeExit
+                $script:LastRemoteSshExitCode = $nativeExit
+            } else {
+                $script:LastRemoteSshExitCode = 1
             }
-            return 1
+            if (-not $Interactive) {
+                return $script:LastRemoteSshExitCode
+            }
+            return
         } finally {
             if ($hasNativePreference) {
                 $global:PSNativeCommandUseErrorActionPreference = $oldNativePreference
@@ -2024,7 +2068,11 @@ function Invoke-RemoteSsh {
     }
     $args += @($HostAlias, $RemoteCommand)
     & ssh @args
-    return $LASTEXITCODE
+    $script:LastRemoteSshExitCode = [int]$LASTEXITCODE
+    if (-not $Interactive) {
+        return $script:LastRemoteSshExitCode
+    }
+    return
 }
 
 function Invoke-RemoteSshCapture {
@@ -2302,7 +2350,8 @@ fi
 '@
 
     $cmd = "bash -lc " + (Quote-ForBashSingle $installScript)
-    $exitCode = Invoke-RemoteSsh -Interactive -RemoteCommand $cmd
+    Invoke-RemoteSsh -Interactive -RemoteCommand $cmd
+    $exitCode = [int]$script:LastRemoteSshExitCode
     return ($exitCode -eq 0)
 }
 
@@ -2541,7 +2590,8 @@ function Start-ReconnectLoop {
     while ($true) {
         Write-Host ""
         Write-Host "connecting to $HostAlias | session=$SessionName | project=$RemoteProjectDir"
-        $exitCode = Invoke-RemoteSsh -Interactive -RemoteCommand $remoteCmd
+        Invoke-RemoteSsh -Interactive -RemoteCommand $remoteCmd
+        $exitCode = [int]$script:LastRemoteSshExitCode
         $delay = 1
 
         if ($exitCode -ne 0) {
@@ -2580,6 +2630,7 @@ $TempDir = Join-Path $env:TEMP "codex-remote"
 $null = New-Item -ItemType Directory -Force -Path $TempDir
 $script:SshConfigPath = Join-Path $TempDir "ssh_config"
 
+Configure-ConsoleUtf8
 Show-Banner
 Ensure-WindowsOpenSsh
 Ensure-Codex

@@ -385,9 +385,35 @@ ensure_session() {
   fi
 }
 
+auto_accept_directory_trust_prompt() {
+  local pane_target="$SESSION_NAME:0.0"
+  local attempt pane_cmd snapshot
+
+  for attempt in $(seq 1 80); do
+    if ! session_exists; then
+      return
+    fi
+
+    pane_cmd="$(tmux display-message -p -t "$pane_target" '#{pane_current_command}' 2>/dev/null || true)"
+    if [ "$pane_cmd" != "codex" ]; then
+      sleep 0.25
+      continue
+    fi
+
+    snapshot="$(tmux capture-pane -p -t "$pane_target" -S -120 2>/dev/null || true)"
+    if printf '%s' "$snapshot" | grep -qi "Do you trust the contents of this directory"; then
+      tmux send-keys -t "$pane_target" "1" Enter
+      return
+    fi
+
+    sleep 0.25
+  done
+}
+
 main() {
   write_heartbeat
   ensure_session
+  auto_accept_directory_trust_prompt >/dev/null 2>&1 &
   exec tmux attach-session -t "$SESSION_NAME"
 }
 
