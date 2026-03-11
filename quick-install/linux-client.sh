@@ -9,6 +9,29 @@ TMP_FILE="$(mktemp)"
 trap 'rm -f "$TMP_FILE"' EXIT
 RULE='------------------------------------------------------------'
 
+HOST_ALIAS=""
+HOST_NAME=""
+USER_NAME=""
+PORT="22"
+IDENTITY_FILE=""
+REMOTE_PROJECT_DIR=""
+SESSION_NAME=""
+IDLE_DAYS="7"
+RECONNECT_DELAY_SECONDS="3"
+SYNC_AUTH="1"
+REMOTE_SCRIPT="/usr/local/bin/codex-vps"
+AUTH_MODE="auto"
+PASSWORD=""
+PROXY_TYPE="no"
+PROXY_SPEC=""
+QUIC_SERVER=""
+QUIC_PORT="61313"
+QUIC_PASSWORD=""
+QUIC_SNI=""
+QUIC_LOCAL_SOCKS_PORT="10809"
+QUIC_UPSTREAM_TYPE="no"
+QUIC_UPSTREAM_SPEC=""
+
 download_with_retry() {
   local url="$1"
   local out_file="$2"
@@ -51,7 +74,7 @@ download_launcher() {
 }
 
 install_launcher() {
-  local target_dir
+  local target_di
   target_dir="$(dirname "$TARGET")"
 
   if [ -d "$target_dir" ] && [ -w "$target_dir" ]; then
@@ -104,7 +127,7 @@ prompt_with_default() {
   local answer=""
 
   if [ -n "$default_value" ]; then
-    read -r -p "$prompt_text [$default_value]: " answer
+    read -r -p "$prompt_text [$default_value]: " answe
     if [ -z "$answer" ]; then
       printf '%s\n' "$default_value"
       return
@@ -113,7 +136,7 @@ prompt_with_default() {
     return
   fi
 
-  read -r -p "$prompt_text: " answer
+  read -r -p "$prompt_text: " answe
   printf '%s\n' "$answer"
 }
 
@@ -205,7 +228,7 @@ quote_env_value() {
 }
 
 write_profile() {
-  local profile_dir
+  local profile_di
   profile_dir="$(dirname "$PROFILE_FILE")"
   mkdir -p "$profile_dir"
   chmod 700 "$profile_dir" 2>/dev/null || true
@@ -227,6 +250,13 @@ write_profile() {
     printf 'PASSWORD_B64="%s"\n' "$(quote_env_value "$(encode_base64 "$PASSWORD")")"
     printf 'PROXY_TYPE="%s"\n' "$(quote_env_value "$PROXY_TYPE")"
     printf 'PROXY_SPEC="%s"\n' "$(quote_env_value "$PROXY_SPEC")"
+    printf 'QUIC_SERVER="%s"\n' "$(quote_env_value "$QUIC_SERVER")"
+    printf 'QUIC_PORT="%s"\n' "$(quote_env_value "$QUIC_PORT")"
+    printf 'QUIC_PASSWORD_B64="%s"\n' "$(quote_env_value "$(encode_base64 "$QUIC_PASSWORD")")"
+    printf 'QUIC_SNI="%s"\n' "$(quote_env_value "$QUIC_SNI")"
+    printf 'QUIC_LOCAL_SOCKS_PORT="%s"\n' "$(quote_env_value "$QUIC_LOCAL_SOCKS_PORT")"
+    printf 'QUIC_UPSTREAM_TYPE="%s"\n' "$(quote_env_value "$QUIC_UPSTREAM_TYPE")"
+    printf 'QUIC_UPSTREAM_SPEC="%s"\n' "$(quote_env_value "$QUIC_UPSTREAM_SPEC")"
     printf 'PASSWORD=""\n'
   } > "$PROFILE_FILE"
 
@@ -286,22 +316,70 @@ collect_profile_inputs() {
   fi
 
   while true; do
-    PROXY_TYPE="$(prompt_with_default "Run through proxy? [no]  no/socks5/http" "$PROXY_TYPE")"
+    PROXY_TYPE="$(prompt_with_default "Run through proxy? [no]  no/socks5/http/quic" "$PROXY_TYPE")"
     PROXY_TYPE="$(printf '%s' "$PROXY_TYPE" | tr '[:upper:]' '[:lower:]')"
     case "$PROXY_TYPE" in
-      no|socks5|http)
+      no|socks5|http|quic)
         break
         ;;
       *)
-        echo "please enter no, socks5, or http." >&2
+        echo "please enter no, socks5, http, or quic." >&2
         ;;
     esac
   done
 
-  if [ "$PROXY_TYPE" != "no" ]; then
+  if [ "$PROXY_TYPE" = "socks5" ] || [ "$PROXY_TYPE" = "http" ]; then
     PROXY_SPEC="$(prompt_required "proxy address (host:port or host:port:username:password)" "$PROXY_SPEC")"
+    QUIC_SERVER=""
+    QUIC_PORT=""
+    QUIC_PASSWORD=""
+    QUIC_SNI=""
+    QUIC_LOCAL_SOCKS_PORT=""
+    QUIC_UPSTREAM_TYPE="no"
+    QUIC_UPSTREAM_SPEC=""
+  elif [ "$PROXY_TYPE" = "quic" ]; then
+    QUIC_SERVER="$(prompt_with_default "quic server host" "${QUIC_SERVER:-$HOST_NAME}")"
+    QUIC_PORT="$(prompt_with_default "quic server port" "${QUIC_PORT:-61313}")"
+    if [ -n "${QUIC_PASSWORD:-}" ]; then
+      read -r -s -p "quic password (stored in profile) [previous password]: " QUIC_PASSWORD_INPUT
+      printf '\n'
+      if [ -n "$QUIC_PASSWORD_INPUT" ]; then
+        QUIC_PASSWORD="$QUIC_PASSWORD_INPUT"
+      fi
+    else
+      read -r -s -p "quic password (stored in profile): " QUIC_PASSWORD
+      printf '\n'
+    fi
+    unset QUIC_PASSWORD_INPUT
+    QUIC_SNI="$(prompt_with_default "quic tls sni (blank=server host)" "${QUIC_SNI:-$QUIC_SERVER}")"
+    QUIC_LOCAL_SOCKS_PORT="$(prompt_with_default "local socks port for quic tunnel" "${QUIC_LOCAL_SOCKS_PORT:-10809}")"
+    while true; do
+      QUIC_UPSTREAM_TYPE="$(prompt_with_default "quic upstream proxy mode [no]  no/socks5/http" "${QUIC_UPSTREAM_TYPE:-no}")"
+      QUIC_UPSTREAM_TYPE="$(printf '%s' "$QUIC_UPSTREAM_TYPE" | tr '[:upper:]' '[:lower:]')"
+      case "$QUIC_UPSTREAM_TYPE" in
+        no|socks5|http)
+          break
+          ;;
+        *)
+          echo "please enter no, socks5, or http." >&2
+          ;;
+      esac
+    done
+    if [ "$QUIC_UPSTREAM_TYPE" = "socks5" ] || [ "$QUIC_UPSTREAM_TYPE" = "http" ]; then
+      QUIC_UPSTREAM_SPEC="$(prompt_required "quic upstream proxy address (host:port or host:port:username:password)" "$QUIC_UPSTREAM_SPEC")"
+    else
+      QUIC_UPSTREAM_SPEC=""
+    fi
+    PROXY_SPEC=""
   else
     PROXY_SPEC=""
+    QUIC_SERVER=""
+    QUIC_PORT=""
+    QUIC_PASSWORD=""
+    QUIC_SNI=""
+    QUIC_LOCAL_SOCKS_PORT=""
+    QUIC_UPSTREAM_TYPE="no"
+    QUIC_UPSTREAM_SPEC=""
   fi
 
   write_profile
@@ -328,6 +406,15 @@ load_defaults_from_existing_profile() {
   fi
   PROXY_TYPE="$(read_profile_value "$PROFILE_FILE" PROXY_TYPE)"
   PROXY_SPEC="$(read_profile_value "$PROFILE_FILE" PROXY_SPEC)"
+  QUIC_SERVER="$(read_profile_value "$PROFILE_FILE" QUIC_SERVER)"
+  QUIC_PORT="$(read_profile_value "$PROFILE_FILE" QUIC_PORT)"
+  QUIC_PASSWORD_B64="$(read_profile_value "$PROFILE_FILE" QUIC_PASSWORD_B64)"
+  QUIC_PASSWORD="$(decode_base64 "$QUIC_PASSWORD_B64")"
+  [ -n "$QUIC_PASSWORD" ] || QUIC_PASSWORD="$(read_profile_value "$PROFILE_FILE" QUIC_PASSWORD)"
+  QUIC_SNI="$(read_profile_value "$PROFILE_FILE" QUIC_SNI)"
+  QUIC_LOCAL_SOCKS_PORT="$(read_profile_value "$PROFILE_FILE" QUIC_LOCAL_SOCKS_PORT)"
+  QUIC_UPSTREAM_TYPE="$(read_profile_value "$PROFILE_FILE" QUIC_UPSTREAM_TYPE)"
+  QUIC_UPSTREAM_SPEC="$(read_profile_value "$PROFILE_FILE" QUIC_UPSTREAM_SPEC)"
 
   [ -n "$HOST_ALIAS" ] || HOST_ALIAS="myvps"
   [ -n "$PORT" ] || PORT="22"
@@ -337,11 +424,14 @@ load_defaults_from_existing_profile() {
   [ -n "$REMOTE_SCRIPT" ] || REMOTE_SCRIPT="/usr/local/bin/codex-vps"
   [ -n "$AUTH_MODE" ] || AUTH_MODE="auto"
   [ -n "$PROXY_TYPE" ] || PROXY_TYPE="no"
+  [ -n "$QUIC_PORT" ] || QUIC_PORT="61313"
+  [ -n "$QUIC_LOCAL_SOCKS_PORT" ] || QUIC_LOCAL_SOCKS_PORT="10809"
+  [ -n "$QUIC_UPSTREAM_TYPE" ] || QUIC_UPSTREAM_TYPE="no"
 }
 
 choose_install_target "$@"
-download_launcher
-install_launcher
+download_launche
+install_launche
 printf 'installed %s\n' "$TARGET"
 
 if [ -t 0 ]; then
@@ -375,3 +465,4 @@ printf 'one-run override command (flags win over profile):\n\n'
 printf '  %s --host-name your.vps.host --user-name root --remote-project-dir /srv/project\n\n' "$TARGET"
 printf 'note: if %s is missing later, overrides are required (--host-name, --user-name, --remote-project-dir).\n' "$PROFILE_FILE"
 printf '%s\n' "$RULE"
+

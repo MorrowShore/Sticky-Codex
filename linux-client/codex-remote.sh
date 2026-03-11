@@ -16,6 +16,13 @@ AUTH_MODE="auto"
 PASSWORD=""
 PROXY_TYPE="no"
 PROXY_SPEC=""
+QUIC_SERVER=""
+QUIC_PORT="61313"
+QUIC_PASSWORD=""
+QUIC_SNI=""
+QUIC_LOCAL_SOCKS_PORT="10809"
+QUIC_UPSTREAM_TYPE="no"
+QUIC_UPSTREAM_SPEC=""
 PROFILE_FILE="${CODEX_REMOTE_PROFILE:-$HOME/.config/sticky-codex/connection.env}"
 
 HOST_ALIAS_SET="0"
@@ -33,7 +40,18 @@ AUTH_MODE_SET="0"
 PASSWORD_SET="0"
 PROXY_TYPE_SET="0"
 PROXY_SPEC_SET="0"
+QUIC_SERVER_SET="0"
+QUIC_PORT_SET="0"
+QUIC_PASSWORD_SET="0"
+QUIC_SNI_SET="0"
+QUIC_LOCAL_SOCKS_PORT_SET="0"
+QUIC_UPSTREAM_TYPE_SET="0"
+QUIC_UPSTREAM_SPEC_SET="0"
 PROFILE_FILE_SET="0"
+
+QUIC_SINGBOX_BIN=""
+QUIC_PID=""
+QUIC_TMP_DIR=""
 
 usage() {
   cat <<'EOF'
@@ -52,8 +70,15 @@ options:
   --reconnect-delay-seconds 3
   --auth-mode auto|key|password
   --password VALUE
-  --proxy-type no|socks5|http
+  --proxy-type no|socks5|http|quic
   --proxy-spec host:port[:username:password]
+  --quic-server HOST
+  --quic-port 61313
+  --quic-password VALUE
+  --quic-sni HOST
+  --quic-local-socks-port 10809
+  --quic-upstream-type no|socks5|http
+  --quic-upstream-spec host:port[:username:password]
   --profile-file PATH
   --no-sync-auth
   --remote-script /usr/local/bin/codex-vps
@@ -276,6 +301,46 @@ load_profile_if_present() {
   if [ "$PROXY_SPEC_SET" = "0" ]; then
     PROXY_SPEC="${PROXY_SPEC:-$(read_profile_value PROXY_SPEC)}"
   fi
+  if [ "$QUIC_SERVER_SET" = "0" ]; then
+    QUIC_SERVER="${QUIC_SERVER:-$(read_profile_value QUIC_SERVER)}"
+  fi
+  if [ "$QUIC_PORT_SET" = "0" ]; then
+    local profile_quic_port
+    profile_quic_port="$(read_profile_value QUIC_PORT)"
+    if [ -n "$profile_quic_port" ]; then
+      QUIC_PORT="$profile_quic_port"
+    fi
+  fi
+  if [ "$QUIC_PASSWORD_SET" = "0" ]; then
+    local profile_quic_password_b64 profile_quic_password_plain
+    profile_quic_password_b64="$(read_profile_value QUIC_PASSWORD_B64)"
+    profile_quic_password_plain="$(decode_base64 "$profile_quic_password_b64")"
+    if [ -n "$profile_quic_password_plain" ]; then
+      QUIC_PASSWORD="$profile_quic_password_plain"
+    else
+      QUIC_PASSWORD="${QUIC_PASSWORD:-$(read_profile_value QUIC_PASSWORD)}"
+    fi
+  fi
+  if [ "$QUIC_SNI_SET" = "0" ]; then
+    QUIC_SNI="${QUIC_SNI:-$(read_profile_value QUIC_SNI)}"
+  fi
+  if [ "$QUIC_LOCAL_SOCKS_PORT_SET" = "0" ]; then
+    local profile_quic_local_socks_port
+    profile_quic_local_socks_port="$(read_profile_value QUIC_LOCAL_SOCKS_PORT)"
+    if [ -n "$profile_quic_local_socks_port" ]; then
+      QUIC_LOCAL_SOCKS_PORT="$profile_quic_local_socks_port"
+    fi
+  fi
+  if [ "$QUIC_UPSTREAM_TYPE_SET" = "0" ]; then
+    local profile_quic_upstream_type
+    profile_quic_upstream_type="$(read_profile_value QUIC_UPSTREAM_TYPE)"
+    if [ -n "$profile_quic_upstream_type" ]; then
+      QUIC_UPSTREAM_TYPE="$(printf '%s' "$profile_quic_upstream_type" | tr '[:upper:]' '[:lower:]')"
+    fi
+  fi
+  if [ "$QUIC_UPSTREAM_SPEC_SET" = "0" ]; then
+    QUIC_UPSTREAM_SPEC="${QUIC_UPSTREAM_SPEC:-$(read_profile_value QUIC_UPSTREAM_SPEC)}"
+  fi
   if [ "$SYNC_AUTH_SET" = "0" ]; then
     local profile_sync_auth
     profile_sync_auth="$(read_profile_value SYNC_AUTH)"
@@ -293,7 +358,7 @@ prompt_with_default() {
   local answer=""
 
   if [ -n "$default_value" ]; then
-    read -r -p "$prompt_text [$default_value]: " answer
+    read -r -p "$prompt_text [$default_value]: " answe
     if [ -z "$answer" ]; then
       printf '%s\n' "$default_value"
       return
@@ -302,7 +367,7 @@ prompt_with_default() {
     return
   fi
 
-  read -r -p "$prompt_text: " answer
+  read -r -p "$prompt_text: " answe
   printf '%s\n' "$answer"
 }
 
@@ -377,7 +442,7 @@ resolve_profile_file() {
 }
 
 write_profile_file() {
-  local profile_dir
+  local profile_di
   profile_dir="$(dirname "$PROFILE_FILE")"
   mkdir -p "$profile_dir"
   chmod 700 "$profile_dir" 2>/dev/null || true
@@ -399,6 +464,13 @@ write_profile_file() {
     printf 'PASSWORD_B64="%s"\n' "$(encode_base64 "$PASSWORD")"
     printf 'PROXY_TYPE="%s"\n' "$PROXY_TYPE"
     printf 'PROXY_SPEC="%s"\n' "$PROXY_SPEC"
+    printf 'QUIC_SERVER="%s"\n' "$QUIC_SERVER"
+    printf 'QUIC_PORT="%s"\n' "$QUIC_PORT"
+    printf 'QUIC_PASSWORD_B64="%s"\n' "$(encode_base64 "$QUIC_PASSWORD")"
+    printf 'QUIC_SNI="%s"\n' "$QUIC_SNI"
+    printf 'QUIC_LOCAL_SOCKS_PORT="%s"\n' "$QUIC_LOCAL_SOCKS_PORT"
+    printf 'QUIC_UPSTREAM_TYPE="%s"\n' "$QUIC_UPSTREAM_TYPE"
+    printf 'QUIC_UPSTREAM_SPEC="%s"\n' "$QUIC_UPSTREAM_SPEC"
     printf 'PASSWORD=""\n'
   } > "$PROFILE_FILE"
 
@@ -454,22 +526,70 @@ initialize_profile_if_missing() {
   esac
 
   while true; do
-    proxy_choice="$(prompt_with_default "Run through proxy? [no]  no/socks5/http" "$PROXY_TYPE")"
+    proxy_choice="$(prompt_with_default "Run through proxy? [no]  no/socks5/http/quic" "$PROXY_TYPE")"
     PROXY_TYPE="$(printf '%s' "$proxy_choice" | tr '[:upper:]' '[:lower:]')"
     case "$PROXY_TYPE" in
-      no|socks5|http)
+      no|socks5|http|quic)
         break
         ;;
       *)
-        echo "please enter no, socks5, or http." >&2
+        echo "please enter no, socks5, http, or quic." >&2
         ;;
     esac
   done
 
-  if [ "$PROXY_TYPE" != "no" ]; then
+  if [ "$PROXY_TYPE" = "socks5" ] || [ "$PROXY_TYPE" = "http" ]; then
     PROXY_SPEC="$(prompt_required "proxy address (host:port or host:port:username:password)" "$PROXY_SPEC")"
+    QUIC_SERVER=""
+    QUIC_PORT="61313"
+    QUIC_PASSWORD=""
+    QUIC_SNI=""
+    QUIC_LOCAL_SOCKS_PORT="10809"
+    QUIC_UPSTREAM_TYPE="no"
+    QUIC_UPSTREAM_SPEC=""
+  elif [ "$PROXY_TYPE" = "quic" ]; then
+    QUIC_SERVER="$(prompt_with_default "quic server host" "${QUIC_SERVER:-$HOST_NAME}")"
+    QUIC_PORT="$(prompt_with_default "quic server port" "${QUIC_PORT:-61313}")"
+    if [ -n "$QUIC_PASSWORD" ]; then
+      read -r -s -p "quic password (stored in profile) [previous password]: " QUIC_PASSWORD_INPUT
+      printf '\n'
+      if [ -n "$QUIC_PASSWORD_INPUT" ]; then
+        QUIC_PASSWORD="$QUIC_PASSWORD_INPUT"
+      fi
+    else
+      read -r -s -p "quic password (stored in profile): " QUIC_PASSWORD
+      printf '\n'
+    fi
+    unset QUIC_PASSWORD_INPUT
+    QUIC_SNI="$(prompt_with_default "quic tls sni (blank=server host)" "${QUIC_SNI:-$QUIC_SERVER}")"
+    QUIC_LOCAL_SOCKS_PORT="$(prompt_with_default "local socks port for quic tunnel" "${QUIC_LOCAL_SOCKS_PORT:-10809}")"
+    while true; do
+      QUIC_UPSTREAM_TYPE="$(prompt_with_default "quic upstream proxy mode [no]  no/socks5/http" "${QUIC_UPSTREAM_TYPE:-no}")"
+      QUIC_UPSTREAM_TYPE="$(printf '%s' "$QUIC_UPSTREAM_TYPE" | tr '[:upper:]' '[:lower:]')"
+      case "$QUIC_UPSTREAM_TYPE" in
+        no|socks5|http)
+          break
+          ;;
+        *)
+          echo "please enter no, socks5, or http." >&2
+          ;;
+      esac
+    done
+    if [ "$QUIC_UPSTREAM_TYPE" = "socks5" ] || [ "$QUIC_UPSTREAM_TYPE" = "http" ]; then
+      QUIC_UPSTREAM_SPEC="$(prompt_required "quic upstream proxy address (host:port or host:port:username:password)" "$QUIC_UPSTREAM_SPEC")"
+    else
+      QUIC_UPSTREAM_SPEC=""
+    fi
+    PROXY_SPEC=""
   else
     PROXY_SPEC=""
+    QUIC_SERVER=""
+    QUIC_PORT="61313"
+    QUIC_PASSWORD=""
+    QUIC_SNI=""
+    QUIC_LOCAL_SOCKS_PORT="10809"
+    QUIC_UPSTREAM_TYPE="no"
+    QUIC_UPSTREAM_SPEC=""
   fi
 
   write_profile_file
@@ -498,16 +618,59 @@ ensure_required_connection_values() {
     fi
     [ -n "$PROXY_TYPE" ] || PROXY_TYPE="no"
     case "$PROXY_TYPE" in
-      no|socks5|http)
+      no|socks5|http|quic)
         ;;
       *)
-        echo "invalid proxy type: $PROXY_TYPE (expected no|socks5|http)" >&2
+        echo "invalid proxy type: $PROXY_TYPE (expected no|socks5|http|quic)" >&2
         exit 1
         ;;
     esac
-    if [ "$PROXY_TYPE" != "no" ] && [ -z "$PROXY_SPEC" ]; then
+    if { [ "$PROXY_TYPE" = "socks5" ] || [ "$PROXY_TYPE" = "http" ]; } && [ -z "$PROXY_SPEC" ]; then
       echo "proxy is enabled but proxy spec is empty." >&2
       exit 1
+    fi
+    if [ "$PROXY_TYPE" = "quic" ]; then
+      [ -n "$QUIC_SERVER" ] || QUIC_SERVER="$HOST_NAME"
+      [ -n "$QUIC_PORT" ] || QUIC_PORT="61313"
+      [ -n "$QUIC_LOCAL_SOCKS_PORT" ] || QUIC_LOCAL_SOCKS_PORT="10809"
+      [ -n "$QUIC_UPSTREAM_TYPE" ] || QUIC_UPSTREAM_TYPE="no"
+      QUIC_UPSTREAM_TYPE="$(printf '%s' "$QUIC_UPSTREAM_TYPE" | tr '[:upper:]' '[:lower:]')"
+      if [ -z "$QUIC_PASSWORD" ]; then
+        echo "proxy type 'quic' requires QUIC_PASSWORD_B64 (or --quic-password)." >&2
+        exit 1
+      fi
+      case "$QUIC_PORT" in
+        ''|*[!0-9]*)
+          echo "proxy type 'quic' requires numeric QUIC_PORT (1-65535)." >&2
+          exit 1
+          ;;
+      esac
+      if [ "$QUIC_PORT" -lt 1 ] || [ "$QUIC_PORT" -gt 65535 ]; then
+        echo "proxy type 'quic' requires QUIC_PORT in range 1-65535." >&2
+        exit 1
+      fi
+      case "$QUIC_LOCAL_SOCKS_PORT" in
+        ''|*[!0-9]*)
+          echo "proxy type 'quic' requires numeric QUIC_LOCAL_SOCKS_PORT (1-65535)." >&2
+          exit 1
+          ;;
+      esac
+      if [ "$QUIC_LOCAL_SOCKS_PORT" -lt 1 ] || [ "$QUIC_LOCAL_SOCKS_PORT" -gt 65535 ]; then
+        echo "proxy type 'quic' requires QUIC_LOCAL_SOCKS_PORT in range 1-65535." >&2
+        exit 1
+      fi
+      case "$QUIC_UPSTREAM_TYPE" in
+        no|socks5|http)
+          ;;
+        *)
+          echo "proxy type 'quic' has invalid QUIC_UPSTREAM_TYPE: $QUIC_UPSTREAM_TYPE (expected no|socks5|http)." >&2
+          exit 1
+          ;;
+      esac
+      if { [ "$QUIC_UPSTREAM_TYPE" = "socks5" ] || [ "$QUIC_UPSTREAM_TYPE" = "http" ]; } && [ -z "$QUIC_UPSTREAM_SPEC" ]; then
+        echo "proxy type 'quic' with upstream mode '$QUIC_UPSTREAM_TYPE' requires QUIC_UPSTREAM_SPEC." >&2
+        exit 1
+      fi
     fi
     return
   fi
@@ -582,6 +745,41 @@ while [ $# -gt 0 ]; do
     --proxy-spec)
       PROXY_SPEC="${2:-}"
       PROXY_SPEC_SET="1"
+      shift 2
+      ;;
+    --quic-server)
+      QUIC_SERVER="${2:-}"
+      QUIC_SERVER_SET="1"
+      shift 2
+      ;;
+    --quic-port)
+      QUIC_PORT="${2:-61313}"
+      QUIC_PORT_SET="1"
+      shift 2
+      ;;
+    --quic-password)
+      QUIC_PASSWORD="${2:-}"
+      QUIC_PASSWORD_SET="1"
+      shift 2
+      ;;
+    --quic-sni)
+      QUIC_SNI="${2:-}"
+      QUIC_SNI_SET="1"
+      shift 2
+      ;;
+    --quic-local-socks-port)
+      QUIC_LOCAL_SOCKS_PORT="${2:-10809}"
+      QUIC_LOCAL_SOCKS_PORT_SET="1"
+      shift 2
+      ;;
+    --quic-upstream-type)
+      QUIC_UPSTREAM_TYPE="${2:-no}"
+      QUIC_UPSTREAM_TYPE_SET="1"
+      shift 2
+      ;;
+    --quic-upstream-spec)
+      QUIC_UPSTREAM_SPEC="${2:-}"
+      QUIC_UPSTREAM_SPEC_SET="1"
       shift 2
       ;;
     --profile-file)
@@ -791,9 +989,329 @@ ensure_ncat_if_proxy_configured() {
   fi
 }
 
+install_codex_cli_local() {
+  local attempts attempt delay
+
+  if ! has_command npm; then
+    echo "npm is missing. attempting to install nodejs and npm..." >&2
+    if ! has_command sudo; then
+      echo "sudo is required to install nodejs/npm automatically." >&2
+      return 1
+    fi
+
+    if has_command apt-get; then
+      sudo apt-get update || true
+      sudo apt-get install -y nodejs npm || true
+    elif has_command dnf; then
+      sudo dnf install -y nodejs npm || true
+    elif has_command yum; then
+      sudo yum install -y nodejs npm || true
+    elif has_command pacman; then
+      sudo pacman -Sy --noconfirm nodejs npm || true
+    elif has_command zypper; then
+      sudo zypper --non-interactive install nodejs npm || true
+    elif has_command apk; then
+      sudo apk add nodejs npm || true
+    else
+      echo "could not find a supported package manager for nodejs/npm." >&2
+      return 1
+    fi
+  fi
+
+  if ! has_command npm; then
+    echo "npm is still unavailable after attempted install." >&2
+    return 1
+  fi
+
+  attempts=5
+  for attempt in $(seq 1 "$attempts"); do
+    if npm install -g @openai/codex; then
+      break
+    fi
+    if [ "$attempt" -lt "$attempts" ]; then
+      delay=$(( attempt * 5 ))
+      if [ "$delay" -gt 30 ]; then
+        delay=30
+      fi
+      echo "codex npm install failed (attempt $attempt/$attempts). retrying in $delay seconds..." >&2
+      sleep "$delay"
+    fi
+  done
+
+  if ! has_command codex; then
+    return 1
+  fi
+
+  return 0
+}
+
+download_file_with_retry() {
+  local url="$1"
+  local out_file="$2"
+  local attempts=6
+  local attempt delay
+
+  for attempt in $(seq 1 "$attempts"); do
+    if curl -fL --connect-timeout 20 --max-time 300 "$url" -o "$out_file"; then
+      return 0
+    fi
+
+    if [ "$attempt" -lt "$attempts" ]; then
+      delay=$(( attempt * 4 ))
+      if [ "$delay" -gt 30 ]; then
+        delay=30
+      fi
+      echo "download failed (attempt $attempt/$attempts). retrying in $delay seconds..." >&2
+      sleep "$delay"
+    fi
+  done
+
+  return 1
+}
+
+resolve_sing_box_bin() {
+  if has_command sing-box; then
+    QUIC_SINGBOX_BIN="$(command -v sing-box)"
+    return 0
+  fi
+
+  if [ -x "$HOME/.local/bin/sing-box" ]; then
+    QUIC_SINGBOX_BIN="$HOME/.local/bin/sing-box"
+    return 0
+  fi
+
+  return 1
+}
+
+install_sing_box_client() {
+  local arch api_url asset_url temp_dir archive_path extracted_bin
+
+  if resolve_sing_box_bin; then
+    return 0
+  fi
+
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64)
+      arch="amd64"
+      ;;
+    aarch64|arm64)
+      arch="arm64"
+      ;;
+    *)
+      echo "unsupported architecture for automatic sing-box install: $arch" >&2
+      return 1
+      ;;
+  esac
+
+  api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+  asset_url="$(curl -fsSL "$api_url" | grep '"browser_download_url"' | cut -d '"' -f 4 | grep "linux-$arch.tar.gz" | head -n1 || true)"
+  if [ -z "$asset_url" ]; then
+    echo "could not find sing-box release asset for linux-$arch." >&2
+    return 1
+  fi
+
+  temp_dir="$(mktemp -d)"
+  archive_path="$temp_dir/sing-box.tar.gz"
+  if ! download_file_with_retry "$asset_url" "$archive_path"; then
+    rm -rf "$temp_dir"
+    return 1
+  fi
+
+  if ! tar -xzf "$archive_path" -C "$temp_dir"; then
+    rm -rf "$temp_dir"
+    return 1
+  fi
+
+  extracted_bin="$(find "$temp_dir" -type f -name "sing-box" | head -n1 || true)"
+  if [ -z "$extracted_bin" ]; then
+    rm -rf "$temp_dir"
+    return 1
+  fi
+
+  mkdir -p "$HOME/.local/bin"
+  install -m 755 "$extracted_bin" "$HOME/.local/bin/sing-box"
+  rm -rf "$temp_dir"
+
+  QUIC_SINGBOX_BIN="$HOME/.local/bin/sing-box"
+  return 0
+}
+
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+tcp_port_open() {
+  local host="$1"
+  local port="$2"
+  if has_command timeout; then
+    timeout 1 bash -lc "echo > /dev/tcp/$host/$port" >/dev/null 2>&1
+    return $?
+  fi
+  bash -lc "echo > /dev/tcp/$host/$port" >/dev/null 2>&1
+}
+
+start_quic_local_proxy_if_configured() {
+  local quic_config_path escaped_server escaped_password escaped_sni
+  local upstream_outbound upstream_detour upstream_type
+  local escaped_upstream_host escaped_upstream_user escaped_upstream_pass
+
+  if [ "$PROXY_TYPE" != "quic" ]; then
+    return
+  fi
+
+  [ -n "$QUIC_SERVER" ] || QUIC_SERVER="$HOST_NAME"
+  [ -n "$QUIC_PORT" ] || QUIC_PORT="61313"
+  [ -n "$QUIC_LOCAL_SOCKS_PORT" ] || QUIC_LOCAL_SOCKS_PORT="10809"
+  [ -n "$QUIC_SNI" ] || QUIC_SNI="$QUIC_SERVER"
+  [ -n "$QUIC_UPSTREAM_TYPE" ] || QUIC_UPSTREAM_TYPE="no"
+
+  if [ -z "$QUIC_PASSWORD" ]; then
+    echo "quic proxy mode requires QUIC_PASSWORD." >&2
+    exit 1
+  fi
+
+  if ! resolve_sing_box_bin && [ -t 0 ]; then
+    local install_quic_core_choice
+    install_quic_core_choice="$(prompt_with_default "quic core (sing-box) is missing on this client. install now? (Y/n)" "Y")"
+    case "$(printf '%s' "$install_quic_core_choice" | tr '[:upper:]' '[:lower:]')" in
+      n|no)
+        echo "quic mode needs sing-box on the client. install was skipped by user." >&2
+        exit 1
+        ;;
+    esac
+  fi
+
+  if ! install_sing_box_client; then
+    echo "failed to install sing-box client automatically for quic proxy mode." >&2
+    exit 1
+  fi
+
+  if tcp_port_open "127.0.0.1" "$QUIC_LOCAL_SOCKS_PORT"; then
+    PROXY_TYPE="socks5"
+    PROXY_SPEC="127.0.0.1:$QUIC_LOCAL_SOCKS_PORT"
+    return
+  fi
+
+  QUIC_TMP_DIR="$(mktemp -d)"
+  quic_config_path="$QUIC_TMP_DIR/sing-box-quic-client.json"
+  escaped_server="$(json_escape "$QUIC_SERVER")"
+  escaped_password="$(json_escape "$QUIC_PASSWORD")"
+  escaped_sni="$(json_escape "$QUIC_SNI")"
+  upstream_outbound=""
+  upstream_detour=""
+
+  case "$QUIC_UPSTREAM_TYPE" in
+    no)
+      ;;
+    socks5|http)
+      if [ -z "$QUIC_UPSTREAM_SPEC" ]; then
+        echo "quic upstream proxy mode '$QUIC_UPSTREAM_TYPE' requires QUIC_UPSTREAM_SPEC." >&2
+        exit 1
+      fi
+      parse_proxy_spec "$QUIC_UPSTREAM_SPEC"
+      escaped_upstream_host="$(json_escape "$PROXY_HOST")"
+      escaped_upstream_user="$(json_escape "$PROXY_USER")"
+      escaped_upstream_pass="$(json_escape "$PROXY_PASS")"
+      if [ "$QUIC_UPSTREAM_TYPE" = "socks5" ]; then
+        upstream_type="socks"
+      else
+        upstream_type="http"
+      fi
+      if [ -n "$PROXY_USER" ]; then
+        upstream_outbound=",
+    {
+      \"type\": \"$upstream_type\",
+      \"tag\": \"quic-upstream\",
+      \"server\": \"$escaped_upstream_host\",
+      \"server_port\": $PROXY_PORT,
+      \"username\": \"$escaped_upstream_user\",
+      \"password\": \"$escaped_upstream_pass\"
+    }"
+      else
+        upstream_outbound=",
+    {
+      \"type\": \"$upstream_type\",
+      \"tag\": \"quic-upstream\",
+      \"server\": \"$escaped_upstream_host\",
+      \"server_port\": $PROXY_PORT
+    }"
+      fi
+      upstream_detour=", \"detour\": \"quic-upstream\""
+      ;;
+    *)
+      echo "invalid quic upstream type: $QUIC_UPSTREAM_TYPE (expected no|socks5|http)." >&2
+      exit 1
+      ;;
+  esac
+
+  cat > "$quic_config_path" <<EOF
+{
+  "log": { "level": "warn" },
+  "inbounds": [
+    {
+      "type": "socks",
+      "listen": "127.0.0.1",
+      "listen_port": $QUIC_LOCAL_SOCKS_PORT
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "hysteria2",
+      "tag": "hy2-out",
+      "server": "$escaped_server",
+      "server_port": $QUIC_PORT,
+      "password": "$escaped_password",
+      "tls": {
+        "enabled": true,
+        "server_name": "$escaped_sni",
+        "insecure": true
+      }$upstream_detour
+    }
+    $upstream_outbound
+  ],
+  "route": { "final": "hy2-out" }
+}
+EOF
+
+  "$QUIC_SINGBOX_BIN" run -c "$quic_config_path" >/dev/null 2>&1 &
+  QUIC_PID="$!"
+
+  for _ in $(seq 1 20); do
+    sleep 0.5
+    if tcp_port_open "127.0.0.1" "$QUIC_LOCAL_SOCKS_PORT"; then
+      PROXY_TYPE="socks5"
+      PROXY_SPEC="127.0.0.1:$QUIC_LOCAL_SOCKS_PORT"
+      return
+    fi
+    if ! kill -0 "$QUIC_PID" >/dev/null 2>&1; then
+      break
+    fi
+  done
+
+  echo "failed to start local quic tunnel client (sing-box)." >&2
+  exit 1
+}
+
 ensure_codex() {
   if has_command codex; then
     return
+  fi
+
+  if [ -t 0 ]; then
+    local install_choice
+    install_choice="$(prompt_with_default "codex cli is missing on this client. install now? (Y/n)" "Y")"
+    case "$(printf '%s' "$install_choice" | tr '[:upper:]' '[:lower:]')" in
+      n|no)
+        echo "codex install skipped by user." >&2
+        ;;
+      *)
+        if install_codex_cli_local && has_command codex; then
+          return
+        fi
+        echo "automatic codex install on this client failed." >&2
+        ;;
+    esac
   fi
 
   echo "codex cli is not installed or not in PATH on this machine." >&2
@@ -825,6 +1343,60 @@ run_scp() {
   fi
 
   scp "$@"
+}
+
+install_remote_codex_cli() {
+  local install_cmd
+  install_cmd="$(cat <<'EOF'
+set -e
+has_command() { command -v "$1" >/dev/null 2>&1; }
+
+if ! has_command npm; then
+  if has_command apt-get; then
+    apt-get update || true
+    apt-get install -y nodejs npm || true
+  elif has_command dnf; then
+    dnf install -y nodejs npm || true
+  elif has_command yum; then
+    yum install -y nodejs npm || true
+  elif has_command pacman; then
+    pacman -Sy --noconfirm nodejs npm || true
+  elif has_command zypper; then
+    zypper --non-interactive install nodejs npm || true
+  elif has_command apk; then
+    apk add nodejs npm || true
+  fi
+fi
+
+if ! has_command npm; then
+  echo "remote install could not find npm even after package install attempts." >&2
+  exit 1
+fi
+
+attempt=1
+while [ "$attempt" -le 5 ]; do
+  if npm install -g @openai/codex; then
+    break
+  fi
+  if [ "$attempt" -lt 5 ]; then
+    delay=$(( attempt * 5 ))
+    if [ "$delay" -gt 30 ]; then
+      delay=30
+    fi
+    echo "remote npm install @openai/codex failed (attempt $attempt/5). retrying in $delay seconds..." >&2
+    sleep "$delay"
+  fi
+  attempt=$((attempt + 1))
+done
+
+if ! has_command codex; then
+  echo "remote codex install completed but codex is still missing from PATH." >&2
+  exit 1
+fi
+EOF
+)"
+
+  run_ssh -tt -F "$SSH_CONFIG_PATH" "$HOST_ALIAS" "bash -lc $(quote_for_bash_single "$install_cmd")"
 }
 
 sync_local_codex_auth_to_remote() {
@@ -965,7 +1537,7 @@ start_reconnect_loop() {
 }
 
 test_remote_prereqs() {
-  local remote_script_arg project_arg check_cmd cmd exit_code
+  local remote_script_arg project_arg check_cmd cmd exit_code install_choice
 
   remote_script_arg="$(quote_for_bash_single "$REMOTE_SCRIPT")"
   project_arg="$(quote_for_bash_single "$REMOTE_PROJECT_DIR")"
@@ -978,12 +1550,42 @@ test_remote_prereqs() {
   fi
   exit_code="$?"
 
+  if [ "$exit_code" -eq 22 ] && [ -t 0 ]; then
+    install_choice="$(prompt_with_default "remote codex is missing on $HOST_ALIAS. install now? (Y/n)" "Y")"
+    case "$(printf '%s' "$install_choice" | tr '[:upper:]' '[:lower:]')" in
+      n|no)
+        ;;
+      *)
+        echo "installing codex on remote host..."
+        if install_remote_codex_cli; then
+          if run_ssh -F "$SSH_CONFIG_PATH" "$HOST_ALIAS" "command -v codex >/dev/null 2>&1"; then
+            echo "remote codex install succeeded."
+            return
+          fi
+        fi
+        echo "automatic remote codex install failed." >&2
+        ;;
+    esac
+  fi
+
   if [ "$exit_code" -ge 20 ] && [ "$exit_code" -le 29 ]; then
     echo "remote preflight failed with exit code $exit_code." >&2
     exit 1
   fi
 
   echo "remote preflight could not complete (exit $exit_code). continuing into reconnect loop."
+}
+
+cleanup_local_helpers() {
+  if [ -n "${QUIC_PID:-}" ] && kill -0 "$QUIC_PID" >/dev/null 2>&1; then
+    kill "$QUIC_PID" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${QUIC_TMP_DIR:-}" ] && [ -d "$QUIC_TMP_DIR" ]; then
+    rm -rf "$QUIC_TMP_DIR"
+  fi
+  if [ -n "${SSH_CONFIG_PATH:-}" ] && [ -f "$SSH_CONFIG_PATH" ]; then
+    rm -f "$SSH_CONFIG_PATH"
+  fi
 }
 
 if [ -z "$SESSION_NAME" ]; then
@@ -995,11 +1597,12 @@ AUTH_MODE="$(normalize_auth_mode "$AUTH_MODE")"
 show_banner
 ensure_ssh_tools
 ensure_sshpass_if_configured
-ensure_ncat_if_proxy_configured
 ensure_codex
 
 SSH_CONFIG_PATH="$(mktemp)"
-trap 'rm -f "$SSH_CONFIG_PATH"' EXIT
+trap cleanup_local_helpers EXIT
+start_quic_local_proxy_if_configured
+ensure_ncat_if_proxy_configured
 
 write_temp_ssh_config
 test_remote_prereqs

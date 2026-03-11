@@ -31,9 +31,17 @@ param(
     [ValidateSet("auto", "key", "password")]
     [string]$AuthMode = "auto",
     [string]$Password = "",
-    [ValidateSet("no", "socks5", "http")]
+    [ValidateSet("no", "socks5", "http", "quic")]
     [string]$ProxyType = "no",
     [string]$ProxySpec = "",
+    [string]$QuicServer = "",
+    [int]$QuicPort = 61313,
+    [string]$QuicPassword = "",
+    [string]$QuicSni = "",
+    [int]$QuicLocalSocksPort = 10809,
+    [ValidateSet("no", "socks5", "http")]
+    [string]$QuicUpstreamType = "no",
+    [string]$QuicUpstreamSpec = "",
     [string]$ProfileFile = $(Join-Path $env:LOCALAPPDATA "sticky-codex\connection.env"),
     [switch]$Help
 )
@@ -43,6 +51,8 @@ $script:SshBackend = "openssh"
 $script:PlinkExe = "plink"
 $script:PscpExe = "pscp"
 $script:NcatExe = "ncat"
+$script:SingBoxExe = "sing-box"
+$script:QuicRunner = $null
 
 function Show-Banner {
     Write-Host "Sticky Codex"
@@ -68,8 +78,15 @@ options:
   -ReconnectDelaySeconds 3
   -AuthMode auto|key|password
   -Password yourpassword
-  -ProxyType no|socks5|http
+  -ProxyType no|socks5|http|quic
   -ProxySpec 127.0.0.1:8080[:username:password]
+  -QuicServer your.vps.host
+  -QuicPort 61313
+  -QuicPassword yourquicpassword
+  -QuicSni your.vps.host
+  -QuicLocalSocksPort 10809
+  -QuicUpstreamType no|socks5|http
+  -QuicUpstreamSpec 127.0.0.1:8080[:username:password]
   -ProfileFile C:\Users\you\AppData\Local\sticky-codex\connection.env
   -NoSyncAuth
   -RemoteScript /usr/local/bin/codex-vps
@@ -269,6 +286,13 @@ function Classify-WingetFailure {
         }
     }
 
+    if ($text -match "no package found matching input criteria|no package found") {
+        return @{
+            Kind = "package-not-found"
+            Summary = "requested package ID was not found in current winget sources."
+        }
+    }
+
     return @{
         Kind = "unknown"
         Summary = "winget failed for an unknown reason."
@@ -297,14 +321,18 @@ function Invoke-WingetInstallWithRetry {
                 Success = $true
                 ExitCode = 0
                 Kind = "ok"
-                Summary = "installed successfully."
-                Tail = ""
+                Summary = "winget completed successfully."
+                Tail = (Get-TextTail -Text $output -MaxLines 12)
             }
         }
 
         $lastOutput = $output
         $lastExitCode = $exitCode
         $lastDiag = Classify-WingetFailure -Output $output -ExitCode $exitCode
+
+        if ($lastDiag.Kind -eq "package-not-found") {
+            break
+        }
 
         if ($attempt -lt $Attempts) {
             $delay = [Math]::Min(30, $BaseDelaySeconds * $attempt)
@@ -357,6 +385,13 @@ function Write-ProfileFile {
         ('PASSWORD_B64="{0}"' -f (Escape-ProfileValue (Encode-Base64 $script:Password))),
         ('PROXY_TYPE="{0}"' -f (Escape-ProfileValue $script:ProxyType)),
         ('PROXY_SPEC="{0}"' -f (Escape-ProfileValue $script:ProxySpec)),
+        ('QUIC_SERVER="{0}"' -f (Escape-ProfileValue $script:QuicServer)),
+        ('QUIC_PORT="{0}"' -f (Escape-ProfileValue "$script:QuicPort")),
+        ('QUIC_PASSWORD_B64="{0}"' -f (Escape-ProfileValue (Encode-Base64 $script:QuicPassword))),
+        ('QUIC_SNI="{0}"' -f (Escape-ProfileValue $script:QuicSni)),
+        ('QUIC_LOCAL_SOCKS_PORT="{0}"' -f (Escape-ProfileValue "$script:QuicLocalSocksPort")),
+        ('QUIC_UPSTREAM_TYPE="{0}"' -f (Escape-ProfileValue $script:QuicUpstreamType)),
+        ('QUIC_UPSTREAM_SPEC="{0}"' -f (Escape-ProfileValue $script:QuicUpstreamSpec)),
         'PASSWORD=""'
     )
 
@@ -429,10 +464,23 @@ function Resolve-NcatExe {
         return $true
     }
 
-    foreach ($candidate in @("$env:ProgramFiles\Nmap\ncat.exe", "$env:ProgramFiles(x86)\Nmap\ncat.exe")) {
+    foreach ($candidate in @("$env:ProgramFiles\Nmap\ncat.exe", "${env:ProgramFiles(x86)}\Nmap\ncat.exe")) {
         if (Test-Path $candidate) {
             $script:NcatExe = $candidate
             return $true
+        }
+    }
+
+    $wingetPkgRoot = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages"
+    if (Test-Path $wingetPkgRoot) {
+        foreach ($pkgPrefix in @("Insecure.Nmap*", "Nmap.Nmap*")) {
+            foreach ($pkgDir in Get-ChildItem -Path $wingetPkgRoot -Directory -Filter $pkgPrefix -ErrorAction SilentlyContinue) {
+                $found = Get-ChildItem -Path $pkgDir.FullName -Filter "ncat.exe" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($found) {
+                    $script:NcatExe = $found.FullName
+                    return $true
+                }
+            }
         }
     }
 
@@ -451,13 +499,22 @@ function Ensure-NcatForProxy {
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     $wingetResult = $null
     if ($winget) {
-        Write-Host "proxy mode requires ncat. attempting install via winget (Nmap)..."
-        $wingetResult = Invoke-WingetInstallWithRetry -PackageId "Nmap.Nmap" -Attempts 6 -BaseDelaySeconds 10
-        if (-not $wingetResult.Success) {
-            Write-Host "winget install Nmap.Nmap failed after retries."
+        $nmapIds = @("Insecure.Nmap", "Nmap.Nmap")
+        foreach ($pkgId in $nmapIds) {
+            Write-Host "proxy mode requires ncat. attempting install via winget package '$pkgId'..."
+            $wingetResult = Invoke-WingetInstallWithRetry -PackageId $pkgId -Attempts 6 -BaseDelaySeconds 10
+            if ($wingetResult.Success) {
+                break
+            }
+
+            Write-Host "winget install $pkgId failed."
             Write-Host "diagnosis: $($wingetResult.Summary) (kind=$($wingetResult.Kind), exit=$($wingetResult.ExitCode))"
             if (-not [string]::IsNullOrWhiteSpace($wingetResult.Tail)) {
                 Write-Host "winget output tail: $($wingetResult.Tail)"
+            }
+
+            if ($wingetResult.Kind -eq "package-not-found") {
+                continue
             }
         }
     }
@@ -471,8 +528,242 @@ function Ensure-NcatForProxy {
             throw "proxy mode requires ncat. auto-install failed due to $($wingetResult.Kind): $($wingetResult.Summary)"
         }
 
+        if ($wingetResult -and $wingetResult.Success) {
+            $extra = ""
+            if (-not [string]::IsNullOrWhiteSpace($wingetResult.Tail)) {
+                $extra = " winget output tail: $($wingetResult.Tail)"
+            }
+            throw "proxy mode requires ncat. winget reported success, but ncat.exe was not found in PATH, Program Files\\Nmap, Program Files (x86)\\Nmap, or %LOCALAPPDATA%\\Microsoft\\WinGet\\Packages.$extra"
+        }
+
         throw "proxy mode requires ncat. install Nmap (ncat), then retry."
     }
+}
+
+function Resolve-SingBoxExe {
+    $cmd = Get-Command sing-box -ErrorAction SilentlyContinue
+    if ($cmd) {
+        $script:SingBoxExe = $cmd.Source
+        return $true
+    }
+
+    $candidate = Join-Path $env:LOCALAPPDATA "sticky-codex\tools\sing-box.exe"
+    if (Test-Path $candidate) {
+        $script:SingBoxExe = $candidate
+        return $true
+    }
+
+    return $false
+}
+
+function Download-SingBoxPortable {
+    $toolDir = Join-Path $env:LOCALAPPDATA "sticky-codex\tools"
+    $null = New-Item -ItemType Directory -Force -Path $toolDir
+
+    $arch = "amd64"
+    if ($env:PROCESSOR_ARCHITECTURE -match "ARM64") {
+        $arch = "arm64"
+    }
+
+    $release = $null
+    $ok = Invoke-WithRetry -Label "fetch sing-box release metadata" -Attempts 5 -BaseDelaySeconds 5 -Action {
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/SagerNet/sing-box/releases/latest" -TimeoutSec 90
+        if (-not $release) {
+            throw "empty release metadata"
+        }
+    }
+    if (-not $ok -or -not $release) {
+        return $false
+    }
+
+    $asset = $release.assets | Where-Object { $_.name -match "windows-$arch\.zip$" } | Select-Object -First 1
+    if (-not $asset) {
+        $asset = $release.assets | Where-Object { $_.name -match "windows-amd64\.zip$" } | Select-Object -First 1
+    }
+    if (-not $asset) {
+        return $false
+    }
+
+    $zipPath = Join-Path $toolDir "sing-box.zip"
+    $extractDir = Join-Path $toolDir "sing-box-extract"
+    if (Test-Path $extractDir) {
+        Remove-Item -Recurse -Force $extractDir
+    }
+
+    $downloaded = Invoke-WithRetry -Label "download sing-box package" -Attempts 6 -BaseDelaySeconds 5 -Action {
+        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath -TimeoutSec 180
+        if (-not (Test-Path $zipPath)) {
+            throw "sing-box download did not produce a file"
+        }
+    }
+    if (-not $downloaded) {
+        return $false
+    }
+
+    try {
+        Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+    } catch {
+        return $false
+    }
+
+    $exe = Get-ChildItem -Path $extractDir -Filter "sing-box.exe" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $exe) {
+        return $false
+    }
+
+    $dest = Join-Path $toolDir "sing-box.exe"
+    Copy-Item -Force $exe.FullName $dest
+    $script:SingBoxExe = $dest
+    return $true
+}
+
+function Ensure-SingBox {
+    if (Resolve-SingBoxExe) {
+        return
+    }
+
+    if ([Environment]::UserInteractive) {
+        $choice = (Prompt-WithDefault -Prompt "quic core (sing-box) is missing on this client. install now? (Y/n)" -Default "Y").ToLowerInvariant()
+        if ($choice -in @("n", "no")) {
+            throw "quic mode requires sing-box on this client. install was skipped by user."
+        }
+    }
+
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if ($winget) {
+        foreach ($pkgId in @("SagerNet.sing-box", "sing-box.sing-box")) {
+            $wingetResult = Invoke-WingetInstallWithRetry -PackageId $pkgId -Attempts 5 -BaseDelaySeconds 8
+            if (Resolve-SingBoxExe) {
+                return
+            }
+            if ($wingetResult.Kind -eq "package-not-found") {
+                continue
+            }
+        }
+    }
+
+    if (Download-SingBoxPortable -and (Resolve-SingBoxExe)) {
+        return
+    }
+
+    throw "quic mode requires sing-box, but it could not be installed automatically."
+}
+
+function Test-TcpPort {
+    param(
+        [string]$Host,
+        [int]$Port,
+        [int]$TimeoutMs = 1200
+    )
+
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $iar = $client.BeginConnect($Host, $Port, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
+            return $false
+        }
+        $client.EndConnect($iar) | Out-Null
+        return $client.Connected
+    } catch {
+        return $false
+    } finally {
+        $client.Close()
+    }
+}
+
+function Ensure-QuicLocalProxy {
+    if ($script:ProxyType -ne "quic") {
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($script:QuicServer)) {
+        $script:QuicServer = $HostName
+    }
+    if ([string]::IsNullOrWhiteSpace($script:QuicSni)) {
+        $script:QuicSni = $script:QuicServer
+    }
+
+    Ensure-SingBox
+
+    if (Test-TcpPort -Host "127.0.0.1" -Port $script:QuicLocalSocksPort -TimeoutMs 900) {
+        $script:ProxyType = "socks5"
+        $script:ProxySpec = "127.0.0.1:$script:QuicLocalSocksPort"
+        return
+    }
+
+    $tmpDir = Join-Path $env:TEMP "codex-remote"
+    $null = New-Item -ItemType Directory -Force -Path $tmpDir
+    $quicCfg = Join-Path $tmpDir "singbox-quic-client.json"
+
+    $cfg = @{
+        log = @{ level = "warn" }
+        inbounds = @(
+            @{
+                type = "socks"
+                listen = "127.0.0.1"
+                listen_port = $script:QuicLocalSocksPort
+            }
+        )
+        outbounds = @()
+        route = @{ final = "hy2-out" }
+    }
+
+    $hy2Outbound = @{
+        type = "hysteria2"
+        tag = "hy2-out"
+        server = $script:QuicServer
+        server_port = $script:QuicPort
+        password = $script:QuicPassword
+        tls = @{
+            enabled = $true
+            server_name = $script:QuicSni
+            insecure = $true
+        }
+    }
+
+    $quicUpstreamType = $script:QuicUpstreamType.ToLowerInvariant()
+    if ($quicUpstreamType -in @("socks5", "http")) {
+        if ([string]::IsNullOrWhiteSpace($script:QuicUpstreamSpec)) {
+            throw "quic upstream proxy is enabled but QUIC_UPSTREAM_SPEC is empty."
+        }
+
+        $upstream = Parse-ProxySpec -Spec $script:QuicUpstreamSpec
+        $upstreamOutbound = @{
+            type = if ($quicUpstreamType -eq "socks5") { "socks" } else { "http" }
+            tag = "quic-upstream"
+            server = $upstream.Host
+            server_port = [int]$upstream.Port
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($upstream.Username)) {
+            $upstreamOutbound.username = $upstream.Username
+            $upstreamOutbound.password = $upstream.Password
+        }
+
+        $cfg.outbounds += $upstreamOutbound
+        $hy2Outbound.detour = "quic-upstream"
+    }
+
+    $cfg.outbounds += $hy2Outbound
+
+    Set-Content -Path $quicCfg -Value ($cfg | ConvertTo-Json -Depth 12)
+
+    $proc = Start-Process -FilePath $script:SingBoxExe -ArgumentList @("run", "-c", $quicCfg) -WindowStyle Hidden -PassThru
+    $script:QuicRunner = $proc
+
+    for ($i = 0; $i -lt 15; $i++) {
+        Start-Sleep -Milliseconds 500
+        if (Test-TcpPort -Host "127.0.0.1" -Port $script:QuicLocalSocksPort -TimeoutMs 600) {
+            $script:ProxyType = "socks5"
+            $script:ProxySpec = "127.0.0.1:$script:QuicLocalSocksPort"
+            return
+        }
+        if ($proc.HasExited) {
+            break
+        }
+    }
+
+    throw "failed to start local QUIC proxy client (sing-box)."
 }
 
 function Get-PuttyProxyArgs {
@@ -489,7 +780,7 @@ function Resolve-PuttyToolsFromKnownLocations {
 
     $known = @(
         "$env:ProgramFiles\PuTTY\plink.exe",
-        "$env:ProgramFiles(x86)\PuTTY\plink.exe",
+        "${env:ProgramFiles(x86)}\PuTTY\plink.exe",
         (Join-Path $env:LOCALAPPDATA "sticky-codex\tools\plink.exe")
     )
     if (-not $plink) {
@@ -503,7 +794,7 @@ function Resolve-PuttyToolsFromKnownLocations {
 
     $known = @(
         "$env:ProgramFiles\PuTTY\pscp.exe",
-        "$env:ProgramFiles(x86)\PuTTY\pscp.exe",
+        "${env:ProgramFiles(x86)}\PuTTY\pscp.exe",
         (Join-Path $env:LOCALAPPDATA "sticky-codex\tools\pscp.exe")
     )
     if (-not $pscp) {
@@ -658,18 +949,55 @@ function Initialize-ProfileIfMissing {
     $script:NoSyncAuth = ($syncChoice -in @("n", "no"))
 
     while ($true) {
-        $proxyChoice = (Prompt-WithDefault -Prompt "Run through proxy? [no]  no/socks5/http" -Default "no").ToLowerInvariant()
-        if ($proxyChoice -in @("no", "socks5", "http")) {
+        $proxyChoice = (Prompt-WithDefault -Prompt "Run through proxy? [no]  no/socks5/http/quic" -Default "no").ToLowerInvariant()
+        if ($proxyChoice -in @("no", "socks5", "http", "quic")) {
             $script:ProxyType = $proxyChoice
             break
         }
-        Write-Host "please enter no, socks5, or http."
+        Write-Host "please enter no, socks5, http, or quic."
     }
 
-    if ($script:ProxyType -ne "no") {
+    if ($script:ProxyType -in @("socks5", "http")) {
         $script:ProxySpec = Prompt-Required -Prompt "proxy address (host:port or host:port:username:password)" -Default $script:ProxySpec
+        $script:QuicUpstreamType = "no"
+        $script:QuicUpstreamSpec = ""
+    } elseif ($script:ProxyType -eq "quic") {
+        $script:QuicServer = Prompt-WithDefault -Prompt "quic server host" -Default $(if ([string]::IsNullOrWhiteSpace($script:QuicServer)) { $script:HostName } else { $script:QuicServer })
+        $script:QuicPort = [int](Prompt-WithDefault -Prompt "quic server port" -Default "$script:QuicPort")
+        $quicPrompt = "quic password (stored in profile)"
+        if (-not [string]::IsNullOrWhiteSpace($script:QuicPassword)) {
+            $quicPrompt = "quic password (stored in profile) [previous password]"
+        }
+        $secureQuic = Read-Host $quicPrompt -AsSecureString
+        $qbstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureQuic)
+        try {
+            $qp = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($qbstr)
+        } finally {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($qbstr)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($qp)) {
+            $script:QuicPassword = $qp
+        }
+        $script:QuicSni = Prompt-WithDefault -Prompt "quic tls sni (blank=server host)" -Default $(if ([string]::IsNullOrWhiteSpace($script:QuicSni)) { $script:QuicServer } else { $script:QuicSni })
+        $script:QuicLocalSocksPort = [int](Prompt-WithDefault -Prompt "local socks port for quic tunnel" -Default "$script:QuicLocalSocksPort")
+        while ($true) {
+            $upstreamChoice = (Prompt-WithDefault -Prompt "quic upstream proxy mode [no]  no/socks5/http" -Default $script:QuicUpstreamType).ToLowerInvariant()
+            if ($upstreamChoice -in @("no", "socks5", "http")) {
+                $script:QuicUpstreamType = $upstreamChoice
+                break
+            }
+            Write-Host "please enter no, socks5, or http."
+        }
+        if ($script:QuicUpstreamType -in @("socks5", "http")) {
+            $script:QuicUpstreamSpec = Prompt-Required -Prompt "quic upstream proxy address (host:port or host:port:username:password)" -Default $script:QuicUpstreamSpec
+        } else {
+            $script:QuicUpstreamSpec = ""
+        }
+        $script:ProxySpec = ""
     } else {
         $script:ProxySpec = ""
+        $script:QuicUpstreamType = "no"
+        $script:QuicUpstreamSpec = ""
     }
 
     Write-ProfileFile -Path $script:ProfileFile
@@ -818,13 +1146,53 @@ function Load-ProfileValues {
 
     if (-not $PSBoundParameters.ContainsKey("ProxyType")) {
         $profileProxyType = (Get-ProfileValue -Map $profileMap -Key "PROXY_TYPE" -Fallback "no").ToLowerInvariant()
-        if ($profileProxyType -in @("no", "socks5", "http")) {
+        if ($profileProxyType -in @("no", "socks5", "http", "quic")) {
             $script:ProxyType = $profileProxyType
         }
     }
 
     if (-not $PSBoundParameters.ContainsKey("ProxySpec")) {
         $script:ProxySpec = Get-ProfileValue -Map $profileMap -Key "PROXY_SPEC"
+    }
+
+    if (-not $PSBoundParameters.ContainsKey("QuicServer")) {
+        $script:QuicServer = Get-ProfileValue -Map $profileMap -Key "QUIC_SERVER"
+    }
+    if (-not $PSBoundParameters.ContainsKey("QuicPort")) {
+        $qp = Get-ProfileValue -Map $profileMap -Key "QUIC_PORT"
+        if (-not [string]::IsNullOrWhiteSpace($qp)) {
+            try {
+                $script:QuicPort = [int]$qp
+            } catch {
+            }
+        }
+    }
+    if (-not $PSBoundParameters.ContainsKey("QuicPassword")) {
+        $script:QuicPassword = Decode-Base64 (Get-ProfileValue -Map $profileMap -Key "QUIC_PASSWORD_B64")
+        if ([string]::IsNullOrWhiteSpace($script:QuicPassword)) {
+            $script:QuicPassword = Get-ProfileValue -Map $profileMap -Key "QUIC_PASSWORD"
+        }
+    }
+    if (-not $PSBoundParameters.ContainsKey("QuicSni")) {
+        $script:QuicSni = Get-ProfileValue -Map $profileMap -Key "QUIC_SNI"
+    }
+    if (-not $PSBoundParameters.ContainsKey("QuicLocalSocksPort")) {
+        $qlp = Get-ProfileValue -Map $profileMap -Key "QUIC_LOCAL_SOCKS_PORT"
+        if (-not [string]::IsNullOrWhiteSpace($qlp)) {
+            try {
+                $script:QuicLocalSocksPort = [int]$qlp
+            } catch {
+            }
+        }
+    }
+    if (-not $PSBoundParameters.ContainsKey("QuicUpstreamType")) {
+        $profileQuicUpstreamType = (Get-ProfileValue -Map $profileMap -Key "QUIC_UPSTREAM_TYPE" -Fallback "no").ToLowerInvariant()
+        if ($profileQuicUpstreamType -in @("no", "socks5", "http")) {
+            $script:QuicUpstreamType = $profileQuicUpstreamType
+        }
+    }
+    if (-not $PSBoundParameters.ContainsKey("QuicUpstreamSpec")) {
+        $script:QuicUpstreamSpec = Get-ProfileValue -Map $profileMap -Key "QUIC_UPSTREAM_SPEC"
     }
 }
 
@@ -850,11 +1218,31 @@ function Ensure-RequiredConnectionValues {
         if ([string]::IsNullOrWhiteSpace($script:ProxyType)) {
             $script:ProxyType = "no"
         }
-        if ($script:ProxyType -notin @("no", "socks5", "http")) {
-            throw "invalid proxy type: $script:ProxyType (expected no|socks5|http)"
+        if ($script:ProxyType -notin @("no", "socks5", "http", "quic")) {
+            throw "invalid proxy type: $script:ProxyType (expected no|socks5|http|quic)"
         }
-        if ($script:ProxyType -ne "no" -and [string]::IsNullOrWhiteSpace($script:ProxySpec)) {
+        if ($script:ProxyType -in @("socks5", "http") -and [string]::IsNullOrWhiteSpace($script:ProxySpec)) {
             throw "proxy is enabled but proxy spec is empty."
+        }
+        if ($script:ProxyType -eq "quic") {
+            if ([string]::IsNullOrWhiteSpace($script:QuicServer)) {
+                $script:QuicServer = $HostName
+            }
+            if ([string]::IsNullOrWhiteSpace($script:QuicPassword)) {
+                throw "proxy type 'quic' requires QUIC_PASSWORD_B64 (or -QuicPassword)."
+            }
+            if ($script:QuicPort -le 0 -or $script:QuicPort -gt 65535) {
+                throw "proxy type 'quic' requires a valid QUIC_PORT."
+            }
+            if ($script:QuicLocalSocksPort -le 0 -or $script:QuicLocalSocksPort -gt 65535) {
+                throw "proxy type 'quic' requires a valid QUIC_LOCAL_SOCKS_PORT."
+            }
+            if ($script:QuicUpstreamType -notin @("no", "socks5", "http")) {
+                throw "proxy type 'quic' has invalid QUIC_UPSTREAM_TYPE: $script:QuicUpstreamType (expected no|socks5|http)."
+            }
+            if ($script:QuicUpstreamType -in @("socks5", "http") -and [string]::IsNullOrWhiteSpace($script:QuicUpstreamSpec)) {
+                throw "proxy type 'quic' with upstream mode '$script:QuicUpstreamType' requires QUIC_UPSTREAM_SPEC."
+            }
         }
         return
     }
@@ -918,11 +1306,71 @@ function Ensure-WindowsOpenSsh {
     }
 }
 
+function Ensure-NpmForCodex {
+    $npm = Get-Command npm -ErrorAction SilentlyContinue
+    if ($npm) {
+        return $true
+    }
+
+    Write-Host "npm is missing. attempting to install Node.js LTS..."
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if (-not $winget) {
+        return $false
+    }
+
+    foreach ($pkgId in @("OpenJS.NodeJS.LTS", "OpenJS.NodeJS")) {
+        $wingetResult = Invoke-WingetInstallWithRetry -PackageId $pkgId -Attempts 5 -BaseDelaySeconds 8
+        if (Get-Command npm -ErrorAction SilentlyContinue) {
+            return $true
+        }
+        if ($wingetResult.Kind -eq "package-not-found") {
+            continue
+        }
+    }
+
+    return [bool](Get-Command npm -ErrorAction SilentlyContinue)
+}
+
+function Install-LocalCodexCli {
+    if (-not (Ensure-NpmForCodex)) {
+        return $false
+    }
+
+    $npmCmd = (Get-Command npm -ErrorAction SilentlyContinue).Source
+    if ([string]::IsNullOrWhiteSpace($npmCmd)) {
+        return $false
+    }
+
+    $ok = Invoke-WithRetry -Label "install @openai/codex with npm" -Attempts 5 -BaseDelaySeconds 6 -Action {
+        $output = (& $npmCmd "install" "-g" "@openai/codex" 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0) {
+            throw "npm install exited with code $LASTEXITCODE. tail: $(Get-TextTail -Text $output -MaxLines 10)"
+        }
+    }
+    if (-not $ok) {
+        return $false
+    }
+
+    return [bool](Get-Command codex -ErrorAction SilentlyContinue)
+}
+
 function Ensure-Codex {
     $codex = Get-Command codex -ErrorAction SilentlyContinue
-    if (-not $codex) {
-        throw "codex cli is not installed or not in PATH on this Windows machine."
+    if ($codex) {
+        return
     }
+
+    if ([Environment]::UserInteractive) {
+        $choice = (Prompt-WithDefault -Prompt "codex cli is missing on this Windows client. install now? (Y/n)" -Default "Y").ToLowerInvariant()
+        if ($choice -notin @("n", "no")) {
+            if (Install-LocalCodexCli) {
+                return
+            }
+            Write-Host "automatic local codex install failed."
+        }
+    }
+
+    throw "codex cli is not installed or not in PATH on this Windows machine."
 }
 
 function Select-SshBackend {
@@ -938,6 +1386,70 @@ function Select-SshBackend {
     }
 
     throw "password auth requires plink/pscp for non-interactive reconnects on Windows. install PuTTY (or rerun quick-install) or switch to key/auto auth."
+}
+
+function Ensure-PuttyHostKeyCached {
+    if ($script:SshBackend -ne "putty") {
+        return
+    }
+
+    $batchArgs = @("-ssh", "-batch", "-P", "$Port", "-l", $UserName)
+    if (-not [string]::IsNullOrWhiteSpace($IdentityFile)) {
+        $batchArgs += @("-i", $IdentityFile)
+    }
+    if ($AuthMode -eq "password" -and -not [string]::IsNullOrWhiteSpace($Password)) {
+        $batchArgs += @("-pw", $Password)
+    }
+    $batchArgs += Get-PuttyProxyArgs
+    $batchArgs += @($HostName, "true")
+
+    $batchOutput = ""
+    $batchExit = 1
+    $oldNativePreference = $null
+    $hasNativePreference = $false
+    if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue) {
+        $hasNativePreference = $true
+        $oldNativePreference = $global:PSNativeCommandUseErrorActionPreference
+        $global:PSNativeCommandUseErrorActionPreference = $false
+    }
+    try {
+        try {
+            $batchOutput = (& $script:PlinkExe @batchArgs 2>&1 | Out-String)
+            $batchExit = $LASTEXITCODE
+        } catch {
+            $batchOutput = ($_ | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+                $batchExit = $LASTEXITCODE
+            }
+        }
+    } finally {
+        if ($hasNativePreference) {
+            $global:PSNativeCommandUseErrorActionPreference = $oldNativePreference
+        }
+    }
+    if ($batchExit -eq 0) {
+        return
+    }
+
+    if ($batchOutput -notmatch "host key is not cached|cannot confirm a host key in batch mode") {
+        return
+    }
+
+    if (-not [Environment]::UserInteractive) {
+        throw "PuTTY host key for $HostName is not cached. run one interactive plink connection first to trust this host key."
+    }
+
+    Write-Host "PuTTY host key for $HostName is not cached. confirming once interactively..."
+    $interactiveArgs = @("-ssh", "-P", "$Port", "-l", $UserName)
+    if (-not [string]::IsNullOrWhiteSpace($IdentityFile)) {
+        $interactiveArgs += @("-i", $IdentityFile)
+    }
+    if ($AuthMode -eq "password" -and -not [string]::IsNullOrWhiteSpace($Password)) {
+        $interactiveArgs += @("-pw", $Password)
+    }
+    $interactiveArgs += Get-PuttyProxyArgs
+    $interactiveArgs += @($HostName, "exit")
+    & $script:PlinkExe @interactiveArgs
 }
 
 function Get-LocalCodexAuthPath {
@@ -1016,6 +1528,70 @@ function Invoke-RemoteScp {
 
     & scp -F $script:SshConfigPath $LocalPath "$HostAlias`:$RemotePath"
     return $LASTEXITCODE
+}
+
+function Install-RemoteCodexCli {
+    $installScript = @'
+set -e
+has_command() { command -v "$1" >/dev/null 2>&1; }
+
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+  if has_command sudo; then
+    SUDO="sudo"
+  else
+    echo "remote install requires root privileges or sudo." >&2
+    exit 1
+  fi
+fi
+
+if ! has_command npm; then
+  if has_command apt-get; then
+    $SUDO apt-get update || true
+    $SUDO apt-get install -y nodejs npm || true
+  elif has_command dnf; then
+    $SUDO dnf install -y nodejs npm || true
+  elif has_command yum; then
+    $SUDO yum install -y nodejs npm || true
+  elif has_command pacman; then
+    $SUDO pacman -Sy --noconfirm nodejs npm || true
+  elif has_command zypper; then
+    $SUDO zypper --non-interactive install nodejs npm || true
+  elif has_command apk; then
+    $SUDO apk add nodejs npm || true
+  fi
+fi
+
+if ! has_command npm; then
+  echo "remote install could not find npm even after package install attempts." >&2
+  exit 1
+fi
+
+attempt=1
+while [ "$attempt" -le 5 ]; do
+  if npm install -g @openai/codex; then
+    break
+  fi
+  if [ "$attempt" -lt 5 ]; then
+    delay=$(( attempt * 5 ))
+    if [ "$delay" -gt 30 ]; then
+      delay=30
+    fi
+    echo "remote npm install @openai/codex failed (attempt $attempt/5). retrying in $delay seconds..." >&2
+    sleep "$delay"
+  fi
+  attempt=$((attempt + 1))
+done
+
+if ! has_command codex; then
+  echo "remote codex install completed but codex is still missing from PATH." >&2
+  exit 1
+fi
+'@
+
+    $cmd = "bash -lc " + (Quote-ForBashSingle $installScript)
+    $exitCode = Invoke-RemoteSsh -Interactive -RemoteCommand $cmd
+    return ($exitCode -eq 0)
 }
 
 function Sync-LocalCodexAuthToRemote {
@@ -1113,6 +1689,21 @@ fi
         return
     }
 
+    if ($exitCode -eq 22 -and [Environment]::UserInteractive) {
+        $choice = (Prompt-WithDefault -Prompt "remote codex is missing on $HostAlias. install now? (Y/n)" -Default "Y").ToLowerInvariant()
+        if ($choice -notin @("n", "no")) {
+            Write-Host "installing codex on remote host..."
+            if (Install-RemoteCodexCli) {
+                $verifyExit = Invoke-RemoteSsh -RemoteCommand "bash -lc 'command -v codex >/dev/null 2>&1'"
+                if ($verifyExit -eq 0) {
+                    Write-Host "remote codex install succeeded."
+                    return
+                }
+            }
+            Write-Host "automatic remote codex install failed."
+        }
+    }
+
     if ($exitCode -ge 20 -and $exitCode -le 29) {
         throw "remote preflight failed with exit code $exitCode."
     }
@@ -1196,7 +1787,9 @@ Show-Banner
 Ensure-WindowsOpenSsh
 Ensure-Codex
 Select-SshBackend
+Ensure-QuicLocalProxy
 Ensure-NcatForProxy
+Ensure-PuttyHostKeyCached
 Write-TempSshConfig
 Test-RemotePrereqs
 
@@ -1205,3 +1798,4 @@ if (-not $NoSyncAuth) {
 }
 
 Start-ReconnectLoop
+

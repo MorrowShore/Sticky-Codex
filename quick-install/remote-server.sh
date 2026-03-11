@@ -37,7 +37,7 @@ prompt_with_default() {
   local answer=""
 
   if [ -n "$default_value" ]; then
-    read -r -p "$prompt_text [$default_value]: " answer
+    read -r -p "$prompt_text [$default_value]: " answe
     if [ -z "$answer" ]; then
       printf '%s\n' "$default_value"
       return
@@ -46,8 +46,290 @@ prompt_with_default() {
     return
   fi
 
-  read -r -p "$prompt_text: " answer
+  read -r -p "$prompt_text: " answe
   printf '%s\n' "$answer"
+}
+
+prompt_required() {
+  local prompt_text="$1"
+  local default_value="${2:-}"
+  local answer=""
+
+  while true; do
+    answer="$(prompt_with_default "$prompt_text" "$default_value")"
+    if [ -n "$answer" ]; then
+      printf '%s\n' "$answer"
+      return
+    fi
+    echo "value is required." >&2
+  done
+}
+
+has_command() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+parse_proxy_spec() {
+  local spec="$1"
+  local host port user pass extra
+
+  IFS=':' read -r host port user pass extra <<EOF
+$spec
+EOF
+
+  if [ -z "$host" ] || [ -z "$port" ]; then
+    echo "invalid proxy spec. expected host:port or host:port:username:password" >&2
+    exit 1
+  fi
+
+  if [ -n "$extra" ] || { [ -n "$user" ] && [ -z "$pass" ]; }; then
+    echo "invalid proxy spec. expected host:port or host:port:username:password" >&2
+    exit 1
+  fi
+
+  UPSTREAM_HOST="$host"
+  UPSTREAM_PORT="$port"
+  UPSTREAM_USER="${user:-}"
+  UPSTREAM_PASS="${pass:-}"
+}
+
+install_sing_box_server() {
+  local arch api_url asset_url temp_dir archive_path extracted_bin install_path
+
+  if has_command sing-box; then
+    printf '%s\n' "$(command -v sing-box)"
+    return
+  fi
+
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *)
+      echo "unsupported architecture for automatic sing-box install: $arch" >&2
+      exit 1
+      ;;
+  esac
+
+  api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+  asset_url="$(curl -fsSL "$api_url" | grep '"browser_download_url"' | cut -d '"' -f 4 | grep "linux-$arch.tar.gz" | head -n1 || true)"
+  if [ -z "$asset_url" ]; then
+    echo "could not find sing-box release asset for linux-$arch." >&2
+    exit 1
+  fi
+
+  temp_dir="$(mktemp -d)"
+  archive_path="$temp_dir/sing-box.tar.gz"
+  if ! download_with_retry "$asset_url" "$archive_path"; then
+    rm -rf "$temp_dir"
+    echo "failed to download sing-box package." >&2
+    exit 1
+  fi
+
+  if ! tar -xzf "$archive_path" -C "$temp_dir"; then
+    rm -rf "$temp_dir"
+    echo "failed to extract sing-box package." >&2
+    exit 1
+  fi
+
+  extracted_bin="$(find "$temp_dir" -type f -name sing-box | head -n1 || true)"
+  if [ -z "$extracted_bin" ]; then
+    rm -rf "$temp_dir"
+    echo "sing-box binary was not found in extracted package." >&2
+    exit 1
+  fi
+
+  install_path="/usr/local/bin/sing-box"
+  if [ -w "/usr/local/bin" ]; then
+    install -m 755 "$extracted_bin" "$install_path"
+  else
+    sudo mkdir -p /usr/local/bin
+    sudo install -m 755 "$extracted_bin" "$install_path"
+  fi
+  rm -rf "$temp_dir"
+
+  printf '%s\n' "$install_path"
+}
+
+configure_quic_server_if_selected() {
+  local choice quic_port quic_password quic_sni upstream_mode upstream_spec
+  local config_dir cert_path key_path config_path service_path singbox_bin
+  local outbound_block final_tag escaped_pass escaped_sni escaped_host escaped_user escaped_proxy_pass singbox_upstream_type
+  local host_hint
+
+  if [ ! -t 0 ]; then
+    return
+  fi
+
+  choice="$(prompt_with_default "set up QUIC proxy server now? (y/N)" "N")"
+  case "$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]')" in
+    y|yes)
+      ;;
+    *)
+      return
+      ;;
+  esac
+
+  quic_port="$(prompt_with_default "quic listen port" "61313")"
+  case "$quic_port" in
+    ''|*[!0-9]*)
+      echo "quic listen port must be numeric (1-65535)." >&2
+      exit 1
+      ;;
+  esac
+  if [ "$quic_port" -lt 1 ] || [ "$quic_port" -gt 65535 ]; then
+    echo "quic listen port must be in range 1-65535." >&2
+    exit 1
+  fi
+  read -r -s -p "quic password (for clients): " quic_password
+  printf '\n'
+  if [ -z "$quic_password" ]; then
+    echo "quic password is required." >&2
+    exit 1
+  fi
+  quic_sni="$(prompt_with_default "tls sni/common-name for certificate" "sticky-codex.local")"
+
+  while true; do
+    upstream_mode="$(prompt_with_default "upstream proxy mode [no]  no/socks5/http" "no")"
+    upstream_mode="$(printf '%s' "$upstream_mode" | tr '[:upper:]' '[:lower:]')"
+    case "$upstream_mode" in
+      no|socks5|http)
+        break
+        ;;
+      *)
+        echo "please enter no, socks5, or http." >&2
+        ;;
+    esac
+  done
+
+  if [ "$upstream_mode" != "no" ]; then
+    upstream_spec="$(prompt_required "upstream proxy address (host:port or host:port:username:password)" "")"
+    parse_proxy_spec "$upstream_spec"
+  fi
+
+  singbox_bin="$(install_sing_box_server)"
+  config_dir="/etc/sticky-codex/quic"
+  cert_path="$config_dir/server.crt"
+  key_path="$config_dir/server.key"
+  config_path="$config_dir/sing-box-server.json"
+  service_path="/etc/systemd/system/sticky-codex-quic.service"
+
+  sudo mkdir -p "$config_dir"
+
+  if ! has_command openssl; then
+    echo "openssl is missing. attempting to install..."
+    if has_command apt-get; then
+      sudo apt-get update || true
+      sudo apt-get install -y openssl || true
+    elif has_command dnf; then
+      sudo dnf install -y openssl || true
+    elif has_command yum; then
+      sudo yum install -y openssl || true
+    elif has_command pacman; then
+      sudo pacman -Sy --noconfirm openssl || true
+    elif has_command zypper; then
+      sudo zypper --non-interactive install openssl || true
+    elif has_command apk; then
+      sudo apk add openssl || true
+    fi
+  fi
+  if ! has_command openssl; then
+    echo "openssl is required for QUIC certificate generation." >&2
+    exit 1
+  fi
+
+  sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+    -subj "/CN=$quic_sni" \
+    -keyout "$key_path" \
+    -out "$cert_path" >/dev/null 2>&1
+
+  escaped_sni="$(json_escape "$quic_sni")"
+  escaped_pass="$(json_escape "$quic_password")"
+  outbound_block='{"type":"direct","tag":"direct"}'
+  final_tag="direct"
+  if [ "$upstream_mode" = "socks5" ] || [ "$upstream_mode" = "http" ]; then
+    escaped_host="$(json_escape "$UPSTREAM_HOST")"
+    escaped_user="$(json_escape "$UPSTREAM_USER")"
+    escaped_proxy_pass="$(json_escape "$UPSTREAM_PASS")"
+    if [ "$upstream_mode" = "socks5" ]; then
+      singbox_upstream_type="socks"
+    else
+      singbox_upstream_type="http"
+    fi
+    if [ -n "$UPSTREAM_USER" ]; then
+      outbound_block="{\"type\":\"$singbox_upstream_type\",\"tag\":\"upstream\",\"server\":\"$escaped_host\",\"server_port\":$UPSTREAM_PORT,\"username\":\"$escaped_user\",\"password\":\"$escaped_proxy_pass\"}"
+    else
+      outbound_block="{\"type\":\"$singbox_upstream_type\",\"tag\":\"upstream\",\"server\":\"$escaped_host\",\"server_port\":$UPSTREAM_PORT}"
+    fi
+    final_tag="upstream"
+  fi
+
+  sudo tee "$config_path" >/dev/null <<EOF
+{
+  "log": { "level": "warn" },
+  "inbounds": [
+    {
+      "type": "hysteria2",
+      "tag": "hy2-in",
+      "listen": "::",
+      "listen_port": $quic_port,
+      "users": [ { "password": "$escaped_pass" } ],
+      "tls": {
+        "enabled": true,
+        "server_name": "$escaped_sni",
+        "certificate_path": "$cert_path",
+        "key_path": "$key_path"
+      }
+    }
+  ],
+  "outbounds": [
+    $outbound_block
+  ],
+  "route": { "final": "$final_tag" }
+}
+EOF
+
+  sudo tee "$service_path" >/dev/null <<EOF
+[Unit]
+Description=Sticky Codex QUIC Proxy (sing-box)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$singbox_bin run -c $config_path
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now sticky-codex-quic.service
+
+  host_hint="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  if [ -z "$host_hint" ]; then
+    host_hint="$(hostname)"
+  fi
+
+  echo
+  echo "QUIC proxy server is configured and running (service: sticky-codex-quic)."
+  echo "client values:"
+  echo "  proxy type: quic"
+  echo "  quic server host: $host_hint"
+  echo "  quic server port: $quic_port"
+  echo "  quic password: (the value you entered)"
+  echo "  quic tls sni: $quic_sni"
+  if [ "$upstream_mode" != "no" ]; then
+    echo "  upstream mode: $upstream_mode"
+    echo "  upstream target: $UPSTREAM_HOST:$UPSTREAM_PORT"
+  fi
 }
 
 download_launcher() {
@@ -68,7 +350,7 @@ download_launcher() {
 }
 
 install_launcher() {
-  local target_dir
+  local target_di
   target_dir="$(dirname "$TARGET")"
 
   if [ -d "$target_dir" ] && [ -w "$target_dir" ]; then
@@ -77,6 +359,76 @@ install_launcher() {
     sudo mkdir -p "$target_dir"
     sudo install -m 755 "$TMP_FILE" "$TARGET"
   fi
+}
+
+install_codex_cli_server() {
+  local attempt delay
+
+  if ! has_command npm; then
+    echo "npm is missing. attempting to install nodejs and npm..."
+    if has_command apt-get; then
+      sudo apt-get update || true
+      sudo apt-get install -y nodejs npm || true
+    elif has_command dnf; then
+      sudo dnf install -y nodejs npm || true
+    elif has_command yum; then
+      sudo yum install -y nodejs npm || true
+    elif has_command pacman; then
+      sudo pacman -Sy --noconfirm nodejs npm || true
+    elif has_command zypper; then
+      sudo zypper --non-interactive install nodejs npm || true
+    elif has_command apk; then
+      sudo apk add nodejs npm || true
+    fi
+  fi
+
+  if ! has_command npm; then
+    echo "npm is still missing after install attempts." >&2
+    return 1
+  fi
+
+  for attempt in 1 2 3 4 5; do
+    if npm install -g @openai/codex; then
+      return 0
+    fi
+    if [ "$attempt" -lt 5 ]; then
+      delay=$(( attempt * 5 ))
+      if [ "$delay" -gt 30 ]; then
+        delay=30
+      fi
+      echo "codex npm install failed (attempt $attempt/5). retrying in $delay seconds..." >&2
+      sleep "$delay"
+    fi
+  done
+
+  return 1
+}
+
+prompt_install_codex_if_missing() {
+  local choice
+
+  if has_command codex; then
+    return
+  fi
+
+  if [ ! -t 0 ]; then
+    echo "codex is missing on this server. run later: npm install -g @openai/codex" >&2
+    return
+  fi
+
+  choice="$(prompt_with_default "codex cli is missing on this server. install now? (Y/n)" "Y")"
+  case "$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]')" in
+    n|no)
+      echo "skipped codex install."
+      ;;
+    *)
+      if install_codex_cli_server && has_command codex; then
+        echo "codex installed successfully."
+      else
+        echo "automatic codex install failed. you can run: npm install -g @openai/codex" >&2
+      fi
+      ;;
+  esac
 }
 
 choose_install_target() {
@@ -107,3 +459,5 @@ choose_install_target "$@"
 download_launcher
 install_launcher
 printf 'installed %s\n' "$TARGET"
+configure_quic_server_if_selected
+prompt_install_codex_if_missing

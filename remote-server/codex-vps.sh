@@ -120,11 +120,79 @@ ensure_codex() {
     return
   fi
 
+  if [ -t 0 ]; then
+    local choice
+    read -r -p "codex cli is missing on this server. install now? (Y/n): " choice
+    case "$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]')" in
+      n|no)
+        ;;
+      *)
+        install_codex_cli_remote
+        if has_command "$CODEX_CMD"; then
+          return
+        fi
+        ;;
+    esac
+  fi
+
   cat >&2 <<EOF
 codex cli is not installed or not in path.
 install codex on the remote machine, then rerun this command.
 EOF
   exit 1
+}
+
+install_codex_cli_remote() {
+  local sudo_cmd=""
+  local attempt delay
+
+  if [ "$(id -u)" -ne 0 ]; then
+    if has_command sudo; then
+      sudo_cmd="sudo"
+    else
+      echo "automatic codex install requires root privileges or sudo." >&2
+      return 1
+    fi
+  fi
+
+  if ! has_command npm; then
+    echo "npm is missing. attempting to install nodejs and npm..."
+    if has_command apt-get; then
+      $sudo_cmd apt-get update || true
+      $sudo_cmd apt-get install -y nodejs npm || true
+    elif has_command dnf; then
+      $sudo_cmd dnf install -y nodejs npm || true
+    elif has_command yum; then
+      $sudo_cmd yum install -y nodejs npm || true
+    elif has_command pacman; then
+      $sudo_cmd pacman -Sy --noconfirm nodejs npm || true
+    elif has_command zypper; then
+      $sudo_cmd zypper --non-interactive install nodejs npm || true
+    elif has_command apk; then
+      $sudo_cmd apk add nodejs npm || true
+    fi
+  fi
+
+  if ! has_command npm; then
+    echo "npm is still missing after installation attempts." >&2
+    return 1
+  fi
+
+  for attempt in 1 2 3 4 5; do
+    if npm install -g @openai/codex; then
+      return 0
+    fi
+    if [ "$attempt" -lt 5 ]; then
+      delay=$(( attempt * 5 ))
+      if [ "$delay" -gt 30 ]; then
+        delay=30
+      fi
+      echo "codex npm install failed (attempt $attempt/5). retrying in $delay seconds..." >&2
+      sleep "$delay"
+    fi
+  done
+
+  return 1
 }
 
 if [ ! -d "$PROJECT_DIR" ]; then

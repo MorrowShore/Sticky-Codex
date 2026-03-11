@@ -280,6 +280,13 @@ function Write-ProfileFile {
         ('PASSWORD_B64="{0}"' -f (Escape-EnvValue $Values.PASSWORD_B64)),
         ('PROXY_TYPE="{0}"' -f (Escape-EnvValue $Values.PROXY_TYPE)),
         ('PROXY_SPEC="{0}"' -f (Escape-EnvValue $Values.PROXY_SPEC)),
+        ('QUIC_SERVER="{0}"' -f (Escape-EnvValue $Values.QUIC_SERVER)),
+        ('QUIC_PORT="{0}"' -f (Escape-EnvValue $Values.QUIC_PORT)),
+        ('QUIC_PASSWORD_B64="{0}"' -f (Escape-EnvValue $Values.QUIC_PASSWORD_B64)),
+        ('QUIC_SNI="{0}"' -f (Escape-EnvValue $Values.QUIC_SNI)),
+        ('QUIC_LOCAL_SOCKS_PORT="{0}"' -f (Escape-EnvValue $Values.QUIC_LOCAL_SOCKS_PORT)),
+        ('QUIC_UPSTREAM_TYPE="{0}"' -f (Escape-EnvValue $Values.QUIC_UPSTREAM_TYPE)),
+        ('QUIC_UPSTREAM_SPEC="{0}"' -f (Escape-EnvValue $Values.QUIC_UPSTREAM_SPEC)),
         'PASSWORD=""'
     )
 
@@ -370,16 +377,57 @@ if ($authMode -eq "password") {
     }
 
     while ($true) {
-        $proxyType = (Prompt-WithDefault -Prompt "Run through proxy? [no]  no/socks5/http" -Default (Get-ProfileValue -Map $profileMap -Key "PROXY_TYPE" -Fallback "no")).ToLowerInvariant()
-        if ($proxyType -in @("no", "socks5", "http")) {
+        $proxyType = (Prompt-WithDefault -Prompt "Run through proxy? [no]  no/socks5/http/quic" -Default (Get-ProfileValue -Map $profileMap -Key "PROXY_TYPE" -Fallback "no")).ToLowerInvariant()
+        if ($proxyType -in @("no", "socks5", "http", "quic")) {
             break
         }
-        Write-Host "please enter no, socks5, or http."
+        Write-Host "please enter no, socks5, http, or quic."
     }
 
     $proxySpec = ""
-    if ($proxyType -ne "no") {
+    $quicServer = ""
+    $quicPort = "61313"
+    $quicPassword = ""
+    $quicSni = ""
+    $quicLocalSocksPort = "10809"
+    $quicUpstreamType = "no"
+    $quicUpstreamSpec = ""
+    if ($proxyType -in @("socks5", "http")) {
         $proxySpec = Prompt-Required -Prompt "proxy address (host:port or host:port:username:password)" -Default (Get-ProfileValue -Map $profileMap -Key "PROXY_SPEC")
+    } elseif ($proxyType -eq "quic") {
+        $quicServer = Prompt-WithDefault -Prompt "quic server host" -Default (Get-ProfileValue -Map $profileMap -Key "QUIC_SERVER" -Fallback $hostName)
+        $quicPort = Prompt-WithDefault -Prompt "quic server port" -Default (Get-ProfileValue -Map $profileMap -Key "QUIC_PORT" -Fallback "61313")
+        $existingQuicPassword = Decode-Base64 (Get-ProfileValue -Map $profileMap -Key "QUIC_PASSWORD_B64")
+        if ([string]::IsNullOrWhiteSpace($existingQuicPassword)) {
+            $existingQuicPassword = Get-ProfileValue -Map $profileMap -Key "QUIC_PASSWORD"
+        }
+        if ([string]::IsNullOrWhiteSpace($existingQuicPassword)) {
+            $secureQuic = Read-Host "quic password (stored in profile)" -AsSecureString
+        } else {
+            $secureQuic = Read-Host "quic password (stored in profile) [previous password]" -AsSecureString
+        }
+        $qbstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureQuic)
+        try {
+            $quicPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($qbstr)
+        } finally {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($qbstr)
+        }
+        if ([string]::IsNullOrWhiteSpace($quicPassword)) {
+            $quicPassword = $existingQuicPassword
+        }
+        $quicSni = Prompt-WithDefault -Prompt "quic tls sni (blank=server host)" -Default (Get-ProfileValue -Map $profileMap -Key "QUIC_SNI" -Fallback $quicServer)
+        $quicLocalSocksPort = Prompt-WithDefault -Prompt "local socks port for quic tunnel" -Default (Get-ProfileValue -Map $profileMap -Key "QUIC_LOCAL_SOCKS_PORT" -Fallback "10809")
+
+        while ($true) {
+            $quicUpstreamType = (Prompt-WithDefault -Prompt "quic upstream proxy mode [no]  no/socks5/http" -Default (Get-ProfileValue -Map $profileMap -Key "QUIC_UPSTREAM_TYPE" -Fallback "no")).ToLowerInvariant()
+            if ($quicUpstreamType -in @("no", "socks5", "http")) {
+                break
+            }
+            Write-Host "please enter no, socks5, or http."
+        }
+        if ($quicUpstreamType -in @("socks5", "http")) {
+            $quicUpstreamSpec = Prompt-Required -Prompt "quic upstream proxy address (host:port or host:port:username:password)" -Default (Get-ProfileValue -Map $profileMap -Key "QUIC_UPSTREAM_SPEC")
+        }
     }
 
     $profileValues = @{
@@ -398,6 +446,13 @@ if ($authMode -eq "password") {
         PASSWORD_B64 = (Encode-Base64 $password)
         PROXY_TYPE = $proxyType
         PROXY_SPEC = $proxySpec
+        QUIC_SERVER = $quicServer
+        QUIC_PORT = $quicPort
+        QUIC_PASSWORD_B64 = (Encode-Base64 $quicPassword)
+        QUIC_SNI = $quicSni
+        QUIC_LOCAL_SOCKS_PORT = $quicLocalSocksPort
+        QUIC_UPSTREAM_TYPE = $quicUpstreamType
+        QUIC_UPSTREAM_SPEC = $quicUpstreamSpec
     }
 
 Write-ProfileFile -Path $ProfileFile -Values $profileValues
@@ -467,3 +522,4 @@ Write-Host "  powershell -ExecutionPolicy Bypass -File `"$Target`" -HostName `"y
 Write-Host ""
 Write-Host "note: if $ProfileFile is missing later, overrides are required (-HostName, -UserName, -RemoteProjectDir)."
 Write-Rule
+

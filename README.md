@@ -21,6 +21,7 @@ download resilience:
 - quick-install scripts use higher network timeouts plus retry/backoff before failing.
 - runtime dependency fetches (PuTTY/Nmap on Windows) also retry before fatal errors.
 - Windows runtime install failures now print a diagnosis (`network`, `winget-unavailable`, `policy-or-permission`, `winget-source`) plus winget output tail.
+- launchers now prompt to install missing `codex` and missing QUIC core (`sing-box`) when needed.
 
 ### remote Linux server
 
@@ -29,6 +30,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/morrowshore/sticky-codex/mai
 ```
 
 installs `codex-vps` to `/usr/local/bin/codex-vps` by default.
+If you choose it during install, it also auto-installs a QUIC proxy server (`sing-box` + systemd service) and can chain it through an upstream `socks5` or `http` proxy.
 
 ### Windows client
 
@@ -148,10 +150,14 @@ password-mode reconnect behavior:
 - both launchers require a saved password value when `auth mode = password`.
 
 proxy mode:
-- both client launchers can prompt for `no|socks5|http`
+- both client launchers can prompt for `no|socks5|http|quic`
 - proxy format is `host:port` or `host:port:username:password`
 - proxy routing uses `ncat` via `ProxyCommand` / `-proxycmd`.
-- Windows launcher auto-attempts `winget install Nmap.Nmap` when proxy is enabled.
+- `quic` mode starts a local `sing-box` client and routes SSH through a local SOCKS port.
+- `quic` mode supports optional upstream proxy chaining (`no|socks5|http`) via `QUIC_UPSTREAM_TYPE` + `QUIC_UPSTREAM_SPEC`.
+- default QUIC server port is `61313` (valid UDP port range: `1-65535`).
+- remote server quick-install can auto-install/configure a QUIC proxy server and optional upstream chain (`no|socks5|http`).
+- Windows launcher auto-attempts `winget install Insecure.Nmap` (then `Nmap.Nmap` fallback) when proxy is enabled.
 - Linux launcher auto-attempts package-manager install for `ncat` when proxy is enabled.
 
 connection resilience:
