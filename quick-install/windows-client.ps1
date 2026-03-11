@@ -405,9 +405,10 @@ if ($authMode -eq "password") {
         $upstreamSpec = Prompt-Required -Prompt "upstream proxy address (host:port or host:port:username:password)" -Default $upstreamSpecDefault
     }
 
+    $wssDefault = if ($proxyTypeFromProfile -in @("quic", "wss")) { "y" } else { "n" }
     $useWss = $false
     while ($true) {
-        $wssChoice = (Prompt-WithDefault -Prompt "Use wss stability layer? [n] y/n" -Default "n").ToLowerInvariant()
+        $wssChoice = (Prompt-WithDefault -Prompt "Use wss stability layer? y/n" -Default $wssDefault).ToLowerInvariant()
         if ($wssChoice -in @("y", "yes")) {
             $useWss = $true
             break

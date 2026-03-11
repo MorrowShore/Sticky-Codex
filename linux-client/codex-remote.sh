@@ -71,7 +71,8 @@ options:
   --reconnect-delay-seconds 3
   --auth-mode auto|key|password
   --password VALUE
-  --proxy-type no|socks5|http|quic|wss
+  --proxy-type no|socks5|http|wss
+    (legacy alias: quic -> wss)
   --proxy-spec host:port[:username:password]
   --quic-server HOST
   --quic-port 61313
@@ -643,6 +644,10 @@ ensure_required_connection_values() {
         exit 1
         ;;
     esac
+    if [ "$PROXY_TYPE" = "quic" ]; then
+      echo "proxy type 'quic' is deprecated; using 'wss' stability mode."
+      PROXY_TYPE="wss"
+    fi
     if { [ "$PROXY_TYPE" = "socks5" ] || [ "$PROXY_TYPE" = "http" ]; } && [ -z "$PROXY_SPEC" ]; then
       echo "proxy is enabled but proxy spec is empty." >&2
       exit 1

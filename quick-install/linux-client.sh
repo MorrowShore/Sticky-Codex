@@ -346,8 +346,14 @@ collect_profile_inputs() {
     upstream_spec="$(prompt_required "upstream proxy address (host:port or host:port:username:password)" "$upstream_spec_default")"
   fi
 
+  local wss_default
+  wss_default="n"
+  if [ "$PROXY_TYPE" = "quic" ] || [ "$PROXY_TYPE" = "wss" ]; then
+    wss_default="y"
+  fi
+
   while true; do
-    use_quic_choice="$(prompt_with_default "Use wss stability layer? [n] y/n" "n")"
+    use_quic_choice="$(prompt_with_default "Use wss stability layer? y/n" "$wss_default")"
     use_quic_choice="$(printf '%s' "$use_quic_choice" | tr '[:upper:]' '[:lower:]')"
     case "$use_quic_choice" in
       y|yes|n|no)

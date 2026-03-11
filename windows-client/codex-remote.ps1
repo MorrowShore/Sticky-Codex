@@ -79,7 +79,8 @@ options:
   -ReconnectDelaySeconds 3
   -AuthMode auto|key|password
   -Password yourpassword
-  -ProxyType no|socks5|http|quic|wss
+  -ProxyType no|socks5|http|wss
+    (legacy alias: quic -> wss)
   -ProxySpec 127.0.0.1:8080[:username:password]
   -QuicServer your.vps.host
   -QuicPort 61313
@@ -760,14 +761,14 @@ function Ensure-SingBox {
 
 function Test-TcpPort {
     param(
-        [string]$Host,
+        [string]$TargetHost,
         [int]$Port,
         [int]$TimeoutMs = 1200
     )
 
     $client = New-Object System.Net.Sockets.TcpClient
     try {
-        $iar = $client.BeginConnect($Host, $Port, $null, $null)
+        $iar = $client.BeginConnect($TargetHost, $Port, $null, $null)
         if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
             return $false
         }
@@ -790,14 +791,14 @@ function Get-AvailableLocalSocksPort {
         $PreferredPort = 10809
     }
 
-    if (-not (Test-TcpPort -Host "127.0.0.1" -Port $PreferredPort -TimeoutMs 500)) {
+    if (-not (Test-TcpPort -TargetHost "127.0.0.1" -Port $PreferredPort -TimeoutMs 500)) {
         return $PreferredPort
     }
 
     $start = [Math]::Min(65535, $PreferredPort + 1)
     $end = [Math]::Min(65535, $PreferredPort + $SearchWindow)
     for ($p = $start; $p -le $end; $p++) {
-        if (-not (Test-TcpPort -Host "127.0.0.1" -Port $p -TimeoutMs 500)) {
+        if (-not (Test-TcpPort -TargetHost "127.0.0.1" -Port $p -TimeoutMs 500)) {
             return $p
         }
     }
@@ -826,7 +827,7 @@ function Ensure-QuicLocalProxy {
 
     Ensure-SingBox
 
-    if (Test-TcpPort -Host "127.0.0.1" -Port $script:QuicLocalSocksPort -TimeoutMs 900) {
+    if (Test-TcpPort -TargetHost "127.0.0.1" -Port $script:QuicLocalSocksPort -TimeoutMs 900) {
         $nextPort = Get-AvailableLocalSocksPort -PreferredPort $script:QuicLocalSocksPort
         Write-Host "local port $script:QuicLocalSocksPort is already in use; quic tunnel will use $nextPort."
         $script:QuicLocalSocksPort = $nextPort
@@ -894,7 +895,7 @@ function Ensure-QuicLocalProxy {
 
     for ($i = 0; $i -lt 15; $i++) {
         Start-Sleep -Milliseconds 500
-        if (Test-TcpPort -Host "127.0.0.1" -Port $script:QuicLocalSocksPort -TimeoutMs 600) {
+        if (Test-TcpPort -TargetHost "127.0.0.1" -Port $script:QuicLocalSocksPort -TimeoutMs 600) {
             $script:ProxyType = "socks5"
             $script:ProxySpec = "127.0.0.1:$script:QuicLocalSocksPort"
             $script:TunnelSshHost = "127.0.0.1"
@@ -928,7 +929,7 @@ function Ensure-WssLocalProxy {
 
     Ensure-SingBox
 
-    if (Test-TcpPort -Host "127.0.0.1" -Port $script:QuicLocalSocksPort -TimeoutMs 900) {
+    if (Test-TcpPort -TargetHost "127.0.0.1" -Port $script:QuicLocalSocksPort -TimeoutMs 900) {
         $nextPort = Get-AvailableLocalSocksPort -PreferredPort $script:QuicLocalSocksPort
         Write-Host "local port $script:QuicLocalSocksPort is already in use; wss tunnel will use $nextPort."
         $script:QuicLocalSocksPort = $nextPort
@@ -1000,7 +1001,7 @@ function Ensure-WssLocalProxy {
 
     for ($i = 0; $i -lt 15; $i++) {
         Start-Sleep -Milliseconds 500
-        if (Test-TcpPort -Host "127.0.0.1" -Port $script:QuicLocalSocksPort -TimeoutMs 600) {
+        if (Test-TcpPort -TargetHost "127.0.0.1" -Port $script:QuicLocalSocksPort -TimeoutMs 600) {
             $script:ProxyType = "socks5"
             $script:ProxySpec = "127.0.0.1:$script:QuicLocalSocksPort"
             $script:TunnelSshHost = "127.0.0.1"
@@ -1496,6 +1497,10 @@ function Ensure-RequiredConnectionValues {
         }
         if ($script:ProxyType -notin @("no", "socks5", "http", "quic", "wss")) {
             throw "invalid proxy type: $script:ProxyType (expected no|socks5|http|quic|wss)"
+        }
+        if ($script:ProxyType -eq "quic") {
+            Write-Host "proxy type 'quic' is deprecated; using 'wss' stability mode."
+            $script:ProxyType = "wss"
         }
         if ($script:ProxyType -in @("socks5", "http") -and [string]::IsNullOrWhiteSpace($script:ProxySpec)) {
             throw "proxy is enabled but proxy spec is empty."

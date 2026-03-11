@@ -150,7 +150,8 @@ password-mode reconnect behavior:
 - both launchers require a saved password value when `auth mode = password`.
 
 proxy mode:
-- both client launchers can prompt for `no|socks5|http|quic|wss`
+- both client launchers can prompt for `no|socks5|http|wss`
+- `quic` is still accepted as a legacy profile/flag alias and is auto-mapped to `wss`.
 - proxy format is `host:port` or `host:port:username:password`
 - proxy routing uses `ncat` via `ProxyCommand` / `-proxycmd`.
 - `wss` mode starts a local `sing-box` client and routes SSH through a local SOCKS port over WebSocket+TLS (TCP).
